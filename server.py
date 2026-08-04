@@ -11,6 +11,25 @@ as defense in depth.
 POST /run  {"hermes_session_id": str|null, "message": str}
   -> {"reply": str, "hermes_session_id": str}  or  {"error": str}
 
+POST /audit  {"tool": str, "args": dict}
+  -> whatever the named audit_tools function returns (always JSON-safe: a
+  dict with "matches"/"content"/etc., or {"error": str})
+  Chat audit toolkit wiring (2026-08-04, Owner-approved "7 read-only audit
+  tools" scope -- see assistant-platform/proposal_chat_audit_toolkit_
+  20260804.md). This shim runs the 7 filesystem/git-facing audit_tools.py
+  functions on Chat's behalf, because this process is host-level (real
+  filesystem access) and assistant-backend (Docker) is not. `tool` must be
+  one of audit_tools.AUDIT_TOOLS' keys -- a closed allowlist, not arbitrary
+  code execution. This endpoint shares the same Bearer-secret gate as /run
+  and /mode, but that secret alone does NOT distinguish an admin Chat user
+  from a non-admin one -- both share the same assistant-backend process.
+  The actual admin-only boundary is enforced upstream, in chat.js: audit
+  tool definitions are only ever added to the model's tool list, and
+  execute_audit_tool is only ever called, when req.user.role === 'admin'.
+  This mirrors the existing pattern in fazleTools.js/piiMask.js, where
+  isAdmin is likewise an app-side gate, not something the downstream data
+  source itself can verify.
+
 hermes_session_id is Hermes's own auto-generated session id (format like
 "20260802_215222_0ecf80"), not a caller-chosen name — `hermes chat -c
 <name>` only RESUMES an existing session, it does not create-and-name one
@@ -32,6 +51,8 @@ import re
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import audit_tools
 
 SESSION_ID_RE = re.compile(r"session_id:\s*(\S+)")
 
@@ -354,6 +375,31 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None):
     return reply, new_session_id, None, mode
 
 
+def _handle_audit(body):
+    """Dispatches one /audit request body to the named audit_tools function.
+    Returns (status_code, payload_dict). Pure function, no I/O of its own
+    beyond what the dispatched audit_tools function does -- kept separate
+    from do_POST (which owns auth + request parsing) so it's directly unit-
+    testable without spinning a real HTTP server, matching this file's
+    existing _parse_run_request/run_hermes split."""
+    tool_name = body.get("tool")
+    fn = audit_tools.AUDIT_TOOLS.get(tool_name)
+    if fn is None:
+        return 400, {"error": f"unknown audit tool: {tool_name!r}. allowed: {list(audit_tools.AUDIT_TOOLS)}"}
+    args = body.get("args") or {}
+    if not isinstance(args, dict):
+        return 400, {"error": "args must be an object"}
+    try:
+        result = fn(**args)
+    except TypeError as e:
+        # Wrong/unexpected argument names or types -- a caller error, not a
+        # server error.
+        return 400, {"error": f"invalid arguments for {tool_name}: {e}"}
+    except Exception as e:  # noqa: BLE001 -- audit endpoint must never 500-crash the shared HTTP server
+        return 500, {"error": f"{tool_name} failed: {e}"}
+    return 200, result
+
+
 def _parse_run_request(body):
     """Validates + normalizes a /run request body. Returns
     (hermes_session_id, message, persona, force_mode, error) — error is a
@@ -419,6 +465,18 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
             return self._send(200, {**new_state, "modes": MODES})
+
+        if self.path == "/audit":
+            auth = self.headers.get("Authorization", "")
+            if not RUNNER_SECRET or auth != f"Bearer {RUNNER_SECRET}":
+                return self._send(401, {"error": "unauthorized"})
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                return self._send(400, {"error": "invalid JSON body"})
+            status, payload = _handle_audit(body)
+            return self._send(status, payload)
 
         if self.path != "/run":
             return self._send(404, {"error": "not found"})
