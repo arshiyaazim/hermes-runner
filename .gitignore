@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+current_mode.txt
+mode_audit.log
