@@ -8,8 +8,13 @@ Bound to 127.0.0.1 only, reached through nginx's IP-restricted
 exposed directly. A shared-secret bearer token is required on top of that,
 as defense in depth.
 
-POST /run  {"hermes_session_id": str|null, "message": str}
+POST /run  {"hermes_session_id": str|null, "message": str,
+            "read_only": bool (optional), "readonly_key": str|null (optional)}
   -> {"reply": str, "hermes_session_id": str}  or  {"error": str}
+  readonly_key (2026-08-05, Owner decision): only consulted when
+  read_only=true -- picks which lock bucket this call serializes against
+  (see _parse_run_request/do_POST) instead of the shared "new" bucket every
+  read_only call used to fall into. Ignored on non-read_only requests.
 
 POST /audit  {"tool": str, "args": dict}
   -> whatever the named audit_tools function returns (always JSON-safe: a
@@ -330,6 +335,24 @@ def _lock_for(key):
         return lock
 
 
+def _lock_key_for(hermes_session_id, force_mode, readonly_key):
+    """Picks the _session_locks key for one /run call (2026-08-05, Owner
+    decision). Interactive/stateful calls (force_mode != "READ") are
+    unaffected -- always hermes_session_id or "new", exactly as before this
+    change. A read_only call (force_mode == "READ") with a caller-supplied
+    readonly_key serializes against that key instead, so independent
+    read-only callers (e.g. the WhatsApp admin relay vs. a Phase 5B job
+    investigation) stop colliding on the one shared "new" bucket every
+    read_only call used to fall into. A read_only call with no readonly_key
+    keeps the prior fallback behavior ("new"), unchanged.
+
+    Extracted as its own function purely for direct unit testing, matching
+    this file's existing _handle_audit extraction pattern."""
+    if force_mode == "READ" and readonly_key:
+        return readonly_key
+    return hermes_session_id or "new"
+
+
 def run_hermes(hermes_session_id, message, persona, force_mode=None):
     """force_mode (Phase 4, 2026-08-04): when set, use that mode's toolset
     for THIS call only — does not read or write the persisted mode file, so
@@ -402,28 +425,39 @@ def _handle_audit(body):
 
 def _parse_run_request(body):
     """Validates + normalizes a /run request body. Returns
-    (hermes_session_id, message, persona, force_mode, error) — error is a
-    string if the request is invalid, else None.
+    (hermes_session_id, message, persona, force_mode, readonly_key, error)
+    — error is a string if the request is invalid, else None.
 
     Phase 4 (2026-08-04): read_only=true (set by the WhatsApp->Hermes
     relay, fazle-core) hard-locks force_mode to READ regardless of the web
     UI's current persisted mode, and is rejected outright if combined with
     a caller-supplied hermes_session_id — a relayed request can never be
     pointed at, or silently continue, an existing (possibly elevated)
-    interactive session."""
+    interactive session.
+
+    2026-08-05 (Owner decision, read-only concurrency fix): optional
+    `readonly_key` -- a caller-chosen string (e.g. "readonly:whatsapp_relay",
+    "readonly:job:bridge_watchdog") used ONLY to pick which lock bucket a
+    read_only call serializes against in do_POST, so independent read-only
+    callers stop colliding on one shared "new" bucket. Parsed unconditionally
+    but only ever consulted downstream when force_mode == "READ" -- a
+    readonly_key on a non-read_only request is simply ignored, same as any
+    other irrelevant field. This does NOT touch the read_only/hermes_session_id
+    rejection above -- that session-isolation rule is unchanged."""
     hermes_session_id = (body.get("hermes_session_id") or "").strip() or None
     message = (body.get("message") or "").strip()
     persona = (body.get("persona") or "").strip() or DEFAULT_PERSONA
     if persona not in PERSONAS:
         persona = DEFAULT_PERSONA
+    readonly_key = (body.get("readonly_key") or "").strip() or None
     if not message:
-        return hermes_session_id, message, persona, None, "message required"
+        return hermes_session_id, message, persona, None, readonly_key, "message required"
 
     read_only = bool(body.get("read_only"))
     if read_only and hermes_session_id:
-        return hermes_session_id, message, persona, None, "read_only requests may not pass hermes_session_id"
+        return hermes_session_id, message, persona, None, readonly_key, "read_only requests may not pass hermes_session_id"
     force_mode = "READ" if read_only else None
-    return hermes_session_id, message, persona, force_mode, None
+    return hermes_session_id, message, persona, force_mode, readonly_key, None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -491,12 +525,15 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return self._send(400, {"error": "invalid JSON body"})
 
-        hermes_session_id, message, persona, force_mode, err = _parse_run_request(body)
+        hermes_session_id, message, persona, force_mode, readonly_key, err = _parse_run_request(body)
         if err:
             return self._send(400, {"error": err})
 
-        lock = _lock_for(hermes_session_id or "new")
+        lock_key = _lock_key_for(hermes_session_id, force_mode, readonly_key)
+        lock = _lock_for(lock_key)
         if not lock.acquire(blocking=False):
+            if force_mode == "READ" and readonly_key:
+                return self._send(409, {"error": f"read-only task '{readonly_key}' is already in progress"})
             return self._send(409, {"error": "a message is already being processed for this session"})
         try:
             reply, new_session_id, error, mode = run_hermes(hermes_session_id, message, persona, force_mode=force_mode)
