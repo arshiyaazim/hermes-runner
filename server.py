@@ -54,7 +54,9 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import audit_tools
@@ -64,7 +66,68 @@ SESSION_ID_RE = re.compile(r"session_id:\s*(\S+)")
 RUNNER_SECRET = os.environ.get("HERMES_RUNNER_SECRET", "")
 PORT = int(os.environ.get("HERMES_RUNNER_PORT", "8093"))
 HERMES_BIN = os.environ.get("HERMES_BIN", os.path.expanduser("~/.local/bin/hermes"))
-TIMEOUT_SECONDS = int(os.environ.get("HERMES_RUN_TIMEOUT", "170"))
+
+# ── Timeout chain (2026-08-06, corrected after a real incident) ────────────
+# Every hop between the browser and this process has its own timeout, and
+# they must be in *strictly decreasing* order working outward, so whichever
+# layer is closest to the actual failure gets to report it first with a
+# real, specific error -- otherwise an outer layer times out first and all
+# the caller sees is a generic "unreachable"/"canceled" with no information.
+# Chain, closest to farthest (each must be less than the next):
+#   this process (below)         < 150s
+#   assistant-backend fetch()      = 180s  (hermes.js, AbortSignal.timeout)
+#   nginx /hermes-internal/        = 200s  (assistant.iamazim.com vhost)
+#   nginx /api/                    = 220s  (assistant.iamazim.com vhost)
+#   browser fetch()                = none  (frontend api.js, no AbortSignal)
+# Previously this was 170s, which was fine on its own (170 < 180, 10s
+# margin) -- broken by a since-reverted retry-on-timeout that made this
+# process's own worst case up to 340s. Confirmed live via journalctl +
+# browser DevTools: a real hang on 2026-08-06 hit exactly this -- the
+# backend's own 180s abort fired mid-retry (its fetch showed 180,564.5ms
+# elapsed with a tiny 403-byte body -- its own "Hermes runner unreachable"
+# error, not anything from this process), while this process kept running
+# for a further ~160s past that, uselessly, and then failed to even write
+# its response back (BrokenPipeError -- the caller was long gone). Lowered
+# to 150s (30s of margin, not 10s) specifically so this process always
+# wins that race and the caller gets a real, specific error body instead
+# of a generic upstream-timeout one.
+TIMEOUT_SECONDS = int(os.environ.get("HERMES_RUN_TIMEOUT", "150"))
+
+# ── Stale-call watchdog fix (2026-08-06 root-cause fix, see incident write-
+# up "Hermes web chat: did not respond in time") ────────────────────────────
+# Root cause, confirmed by reading Hermes's own installed source
+# (~/.hermes/hermes-agent/run_agent.py + agent/model_metadata.py), not
+# guessed: Hermes's SSE HTTP client uses `read=None` (no read timeout at
+# all) by design, relying entirely on its own internal "stale-call"
+# watchdog (run_agent.py::_resolved_api_call_stale_timeout_base(),
+# default 90s) to abort and retry/fail-over a stream that stops producing
+# data without closing. That watchdog auto-DISABLES itself (returns an
+# infinite timeout) whenever the target base_url resolves as a "local
+# endpoint" (agent/model_metadata.py::is_local_endpoint() — loopback/RFC-
+# 1918/Tailscale ranges) AND no explicit override is set — a heuristic
+# meant for slow local model inference (e.g. bare Ollama), which
+# misidentifies our setup: our base_url (http://127.0.0.1:20128/v1) is
+# OmniRoute, a *proxy* to remote cloud providers that normally reply in
+# single-digit seconds (confirmed live: kimi-k3 answered in ~8s). Because
+# of that misclassification, every single call from this shim ran with
+# Hermes's own stale-stream safety net silently off, so a stalled stream
+# had no recovery path except our blunt external subprocess timeout
+# below (170s of total silence, then a hard SIGKILL with nothing to show
+# for it).
+#
+# `HERMES_API_CALL_STALE_TIMEOUT` is Hermes's own documented env-var
+# escape hatch for this (run_agent.py's priority-order docstring lists it
+# explicitly, ahead of the implicit default) — setting it does not touch
+# a single file inside the Hermes CLI's own installed/updatable package,
+# it's the supported integration surface, same category as HERMES_BIN/
+# HERMES_RUN_TIMEOUT above. Re-enabling it lets Hermes's own retry/
+# fail-over logic catch a stalled stream well before our external
+# TIMEOUT_SECONDS ceiling would ever need to fire. Default of 90s
+# deliberately matches Hermes's own documented non-local default rather
+# than an invented number — it's already the value Hermes's own
+# maintainers consider safe against false-positive aborts on a
+# legitimately-slower single call.
+STALE_CALL_TIMEOUT_SECONDS = os.environ.get("HERMES_API_CALL_STALE_TIMEOUT", "90")
 
 # ── Capability mode gate (AI_ROLES_POLICY.md target, built 2026-08-03) ──
 # Gates WHAT Hermes can do once invoked, on top of the existing WHO-can-
@@ -353,6 +416,52 @@ def _lock_key_for(hermes_session_id, force_mode, readonly_key):
     return hermes_session_id or "new"
 
 
+def _log(msg: str) -> None:
+    """Timestamped diagnostic line to stderr — systemd's StandardError=
+    already captures this to runner.log (same destination as the existing
+    do_POST whatsapp-relay line and BaseHTTPRequestHandler's own request
+    log below), so this needs no new log file or config. Deliberately logs
+    only timing/outcome, never the message body or reply text."""
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+    sys.stderr.write(f"[hermes-runner] {ts} {msg}\n")
+
+
+def _run_hermes_once(cmd, env, timeout_seconds):
+    """The one subprocess.run() attempt at the `hermes chat` CLI, with
+    before/after diagnostic logging (2026-08-06) so a hang shows its actual
+    timing instead of pure silence until the caller's own timeout error.
+    Returns (CompletedProcess | None, timed_out).
+
+    2026-08-06: this used to retry once on timeout ("Phase 2 mitigation").
+    Removed after a real incident proved it actively harmful, not just
+    unhelpful: the retry made this process's own worst-case latency (up to
+    340s) exceed assistant-backend's fixed 180s AbortSignal on its call to
+    this endpoint (see TIMEOUT_SECONDS' own comment above for the full
+    chain and the incident evidence). The retry could never actually
+    reach the browser even on the rare case it would have succeeded --
+    the backend had already given up and shown the user a generic,
+    uninformative error long before the second attempt could finish. A
+    single attempt, safely under every caller's own timeout, always lets
+    this process report its own specific error first."""
+    started = time.monotonic()
+    _log(f"subprocess start timeout={timeout_seconds}s")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - started
+        _log(f"subprocess TIMEOUT after {elapsed:.1f}s")
+        return None, True
+    elapsed = time.monotonic() - started
+    _log(f"subprocess done in {elapsed:.1f}s returncode={result.returncode}")
+    return result, False
+
+
 def run_hermes(hermes_session_id, message, persona, force_mode=None):
     """force_mode (Phase 4, 2026-08-04): when set, use that mode's toolset
     for THIS call only — does not read or write the persisted mode file, so
@@ -377,15 +486,14 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None):
     ]
     if hermes_session_id:
         cmd += ["--resume", hermes_session_id]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
+
+    # See STALE_CALL_TIMEOUT_SECONDS' definition above for why this is set.
+    env = {**os.environ, "HERMES_API_CALL_STALE_TIMEOUT": STALE_CALL_TIMEOUT_SECONDS}
+
+    result, timed_out = _run_hermes_once(cmd, env, TIMEOUT_SECONDS)
+    if timed_out:
         return None, None, "Hermes did not respond in time", mode
+
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-2000:]
         return None, None, f"Hermes exited with an error: {detail}", mode
