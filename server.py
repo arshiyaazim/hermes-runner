@@ -67,6 +67,25 @@ RUNNER_SECRET = os.environ.get("HERMES_RUNNER_SECRET", "")
 PORT = int(os.environ.get("HERMES_RUNNER_PORT", "8093"))
 HERMES_BIN = os.environ.get("HERMES_BIN", os.path.expanduser("~/.local/bin/hermes"))
 
+# ── Model override (Problem #3, 2026-08-09) ─────────────────────────────────
+# ~/.hermes/config.yaml's model.default (groq/llama-3.1-8b-instant) has a
+# 6,000 TPM tier limit far below what a real READ-mode request needs
+# (measured 28,542 tokens even after trimming every safely-removable source
+# — see Hermes commits 61c36897e/cfea8ca18) — every call from this shim was
+# 413-ing and silently falling back to Gemini. Rather than change Hermes's
+# own global model.default (would also affect the dashboard/CLI, which this
+# shim doesn't touch and hasn't been shown to have the same problem), pin
+# THIS caller specifically to the model config.yaml's own fallback_providers
+# already lists first and that has answered every single test turn during
+# the Problem #1/#2/#3 investigation without ever erroring (context_length
+# 1,048,576 per OmniRoute's catalog vs Groq's 131,072 — no TPM-tier issue
+# observed on this route). Same "supported integration surface" pattern as
+# HERMES_API_CALL_STALE_TIMEOUT above — an env var this shim controls, not
+# a change to any file inside Hermes's own installed/updatable package.
+# Passed as `-m` on every call (see run_hermes below); leave unset/empty to
+# fall back to Hermes's own configured default.
+HERMES_RUNNER_MODEL = os.environ.get("HERMES_RUNNER_MODEL", "gemini/gemini-3.1-flash-lite")
+
 # ── Timeout chain (2026-08-06, corrected after a real incident) ────────────
 # Every hop between the browser and this process has its own timeout, and
 # they must be in *strictly decreasing* order working outward, so whichever
@@ -484,6 +503,8 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None):
         "tool",
         "-Q",
     ]
+    if HERMES_RUNNER_MODEL:
+        cmd += ["-m", HERMES_RUNNER_MODEL]
     if hermes_session_id:
         cmd += ["--resume", hermes_session_id]
 
