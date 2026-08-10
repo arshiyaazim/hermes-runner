@@ -140,6 +140,45 @@ class TestTTLValidation(ModeTTLTestBase):
         self.assertIsNotNone(state["expires_at"])
 
 
+class TestMandatoryTTLFallback(ModeTTLTestBase):
+    """Regression for the Hermes Capability Expansion Level 2 fix
+    (2026-08-10): BUILD/RUN with no ttl_seconds and no TASK/SESSION scope
+    used to fall through to a permanent grant (expires_at=None). RUN mode
+    is close to unrestricted host access, so this must never happen
+    silently — see DEFAULT_TTL_SECONDS_WHEN_UNSPECIFIED."""
+
+    def test_build_with_no_ttl_and_no_scope_gets_default_ttl_not_permanent(self):
+        state = server.write_mode_state("BUILD")
+        self.assertIsNotNone(state["expires_at"])
+        self.assertEqual(state["seconds_remaining"], server.DEFAULT_TTL_SECONDS_WHEN_UNSPECIFIED)
+
+    def test_run_with_no_ttl_and_no_scope_gets_default_ttl_not_permanent(self):
+        state = server.write_mode_state("RUN")
+        self.assertIsNotNone(state["expires_at"])
+        self.assertEqual(state["seconds_remaining"], server.DEFAULT_TTL_SECONDS_WHEN_UNSPECIFIED)
+
+    def test_run_with_time_scope_but_no_ttl_also_gets_default_not_permanent(self):
+        # "TIME" scope previously fell through the TASK/SESSION-only elif
+        # untouched, same permanent-fallthrough bug as omitting scope
+        # entirely.
+        state = server.write_mode_state("RUN", scope="TIME")
+        self.assertIsNotNone(state["expires_at"])
+
+    def test_explicit_ttl_still_overrides_the_default(self):
+        state = server.write_mode_state("RUN", ttl_seconds=120)
+        self.assertEqual(state["seconds_remaining"], 120)
+
+    def test_default_fallback_ttl_actually_expires_the_grant(self):
+        server.write_mode_state("RUN")
+        past = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=5)).isoformat()
+        with open(self.mode_file, "w") as f:
+            json.dump(
+                {"mode": "RUN", "set_at": past, "expires_at": past, "scope": None, "set_by": "admin"}, f
+            )
+        state = server.read_mode_state()
+        self.assertEqual(state["mode"], "READ")
+
+
 class TestScopes(ModeTTLTestBase):
     def test_task_scoped_gets_default_ttl_when_unspecified(self):
         state = server.write_mode_state("BUILD", scope="TASK")

@@ -198,6 +198,15 @@ TTL_MAX_SECONDS = 86400  # 24h
 # session) — approximated as a conservative default TTL instead of a true
 # "ends when the task/session ends" boundary. Documented, not oversold.
 DEFAULT_SCOPE_TTL_SECONDS = {"TASK": 3600, "SESSION": 1800}
+# Hermes Capability Expansion Level 2 (2026-08-10, Owner-confirmed): a
+# BUILD/RUN elevation with no explicit ttl_seconds and no TASK/SESSION
+# scope used to fall through to expires_at=None (permanent, until manually
+# reverted) — RUN mode is close to unrestricted host access (see the
+# approved plan), so "forgot to pass a TTL" silently meaning "forever" is
+# exactly the failure mode this constant closes. Applied below whenever no
+# TTL was resolved any other way; READ is unaffected (always permanent by
+# design, see the mode == DEFAULT_MODE check further down).
+DEFAULT_TTL_SECONDS_WHEN_UNSPECIFIED = 1800  # 30 min
 
 _mode_lock = threading.Lock()
 AUDIT_LOG_FILE = os.environ.get(
@@ -330,6 +339,11 @@ def write_mode_state(mode, ttl_seconds=None, scope=None, set_by="admin"):
         # shim has no real task/session-end hook, so approximate with a
         # conservative default rather than granting a permanent elevation.
         ttl_seconds = DEFAULT_SCOPE_TTL_SECONDS[scope]
+    elif mode != DEFAULT_MODE:
+        # No TTL, no TASK/SESSION scope, and elevating past the safe
+        # default — apply the mandatory fallback TTL instead of falling
+        # through to permanent (see DEFAULT_TTL_SECONDS_WHEN_UNSPECIFIED).
+        ttl_seconds = DEFAULT_TTL_SECONDS_WHEN_UNSPECIFIED
 
     now = _now()
     expires_at = (now + datetime.timedelta(seconds=ttl_seconds)).isoformat() if ttl_seconds else None
