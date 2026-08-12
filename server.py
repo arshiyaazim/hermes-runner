@@ -112,6 +112,18 @@ RUNNER_CUSTOMER_SECRET = os.environ.get("HERMES_RUNNER_CUSTOMER_SECRET", "")
 # fall back to Hermes's own configured default.
 HERMES_RUNNER_MODEL = os.environ.get("HERMES_RUNNER_MODEL", "gemini/gemini-3.1-flash-lite")
 
+# Provider override paired with HERMES_RUNNER_MODEL above (2026-08-11, see
+# the provider-routing audit): without an explicit `--provider`, Hermes's
+# own resolve_requested_provider() falls through to config.yaml's global
+# model.provider ("omniroute") regardless of what -m carries — so a bare
+# HERMES_RUNNER_MODEL naming an ollama-local/nous-free model silently gets
+# sent to OmniRoute instead and fails there. Passed as `--provider` on every
+# call, same pattern/location as HERMES_RUNNER_MODEL; leave unset/empty
+# (the default) to preserve today's exact behavior — no --provider flag is
+# added, and resolution falls through to config.yaml's model.provider
+# exactly as it does now.
+HERMES_RUNNER_PROVIDER = os.environ.get("HERMES_RUNNER_PROVIDER", "")
+
 # ── Timeout chain (2026-08-06, corrected after a real incident) ────────────
 # Every hop between the browser and this process has its own timeout, and
 # they must be in *strictly decreasing* order working outward, so whichever
@@ -638,6 +650,8 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
     ]
     if HERMES_RUNNER_MODEL:
         cmd += ["-m", HERMES_RUNNER_MODEL]
+    if HERMES_RUNNER_PROVIDER:
+        cmd += ["--provider", HERMES_RUNNER_PROVIDER]
     if hermes_session_id:
         cmd += ["--resume", hermes_session_id]
 
