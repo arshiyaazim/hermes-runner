@@ -71,15 +71,194 @@ class TestRunHermesForceMode(unittest.TestCase):
         self.assertEqual(mode, "READ")
 
 
+class TestReadonlySessionContinuity(unittest.TestCase):
+    """2026-08-13, Bridge1 Hermes Control Channel follow-up: a successful
+    READ-mode turn registers its session_id as legitimately resumable
+    under read_only; non-READ turns never do, and the registration is
+    what _parse_run_request's allowlist check (see TestParseRunRequest)
+    actually consults."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.mode_file = os.path.join(self.tmp_dir, "current_mode.txt")
+        self._mode_patch = patch.object(server, "MODE_FILE", self.mode_file)
+        self._mode_patch.start()
+        server._readonly_originated_sessions.clear()
+
+    def tearDown(self):
+        self._mode_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        server._readonly_originated_sessions.clear()
+
+    def _fake_result(self, stdout="reply text", stderr="session_id: read-only-abc", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @patch("server.subprocess.run")
+    def test_successful_read_mode_call_registers_session(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        _, session_id, error, mode = server.run_hermes(None, "hello", "helpful", force_mode="READ")
+        self.assertIsNone(error)
+        self.assertEqual(mode, "READ")
+        self.assertTrue(server._is_readonly_originated_session(session_id))
+
+    @patch("server.subprocess.run")
+    def test_build_mode_call_does_not_register_session(self, mock_run):
+        mock_run.return_value = self._fake_result(stderr="session_id: build-mode-session")
+        server.run_hermes(None, "hello", "helpful", force_mode="BUILD")
+        self.assertFalse(server._is_readonly_originated_session("build-mode-session"))
+
+    @patch("server.subprocess.run")
+    def test_second_read_only_call_can_resume_first_call_own_session(self, mock_run):
+        """The actual continuity story end to end: call 1 (no session) ->
+        registers a session; call 2 passes that session back under
+        read_only and _parse_run_request accepts it (not rejected)."""
+        mock_run.return_value = self._fake_result(stderr="session_id: turn-one-session")
+        _, session_id, error, _ = server.run_hermes(None, "first turn", "helpful", force_mode="READ")
+        self.assertIsNone(error)
+
+        body = {"read_only": True, "hermes_session_id": session_id, "message": "second turn"}
+        parsed_session, _, _, force_mode, _, _, err = server._parse_run_request(body)
+        self.assertIsNone(err)
+        self.assertEqual(force_mode, "READ")
+        self.assertEqual(parsed_session, session_id)
+
+    @patch("server.subprocess.run", side_effect=OSError("no such file or directory"))
+    def test_subprocess_launch_failure_returns_clean_error_not_exception(self, mock_run):
+        """2026-08-13: previously an OSError (or any non-timeout exception)
+        from subprocess.run() propagated fully uncaught through
+        run_hermes() -- indistinguishable, from the caller's side, from
+        the 2 unexplained hangs found in the 2026-08-13 capability
+        assessment. Now caught, logged (see subprocess_diag.log), and
+        surfaced as a normal (reply=None, error=str) result."""
+        reply, session_id, error, mode = server.run_hermes(None, "hello", "helpful", force_mode="READ")
+        self.assertIsNone(reply)
+        self.assertIsNotNone(error)
+        self.assertIn("OSError", error)
+
+
+class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
+    """2026-08-12: the WhatsApp Admin relay's readonly_key must select
+    MiniMax-M3/minimax instead of HERMES_RUNNER_MODEL/PROVIDER's default —
+    and every other caller (no readonly_key, or a different one, e.g.
+    Phase 5B's "readonly:job:<name>") must be completely unaffected."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.mode_file = os.path.join(self.tmp_dir, "current_mode.txt")
+        self._mode_patch = patch.object(server, "MODE_FILE", self.mode_file)
+        self._mode_patch.start()
+
+    def tearDown(self):
+        self._mode_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _fake_result(self, stdout="reply text", stderr="session_id: abc123", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @patch("server.subprocess.run")
+    def test_whatsapp_relay_readonly_key_selects_minimax(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", force_mode="READ",
+            readonly_key="readonly:whatsapp_relay",
+        )
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL)
+        self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER)
+        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, "MiniMax-M3")
+        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER, "minimax")
+
+    @patch("server.subprocess.run")
+    def test_no_readonly_key_keeps_default_model(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", force_mode="READ")
+        cmd = mock_run.call_args[0][0]
+        if server.HERMES_RUNNER_MODEL:
+            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
+        self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
+
+    @patch("server.subprocess.run")
+    def test_different_readonly_key_keeps_default_model(self, mock_run):
+        """Phase 5B alert-investigation jobs use readonly:job:<name> — must
+        NOT be swept into the WhatsApp-relay-only override."""
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", force_mode="READ",
+            readonly_key="readonly:job:bridge_watchdog",
+        )
+        cmd = mock_run.call_args[0][0]
+        if server.HERMES_RUNNER_MODEL:
+            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
+        self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
+
+    @patch("server.subprocess.run")
+    def test_customer_scope_keeps_default_model(self, mock_run):
+        """caller_scope="customer" (hermes_dispatch.py) never sends this
+        readonly_key — confirm it's unaffected too."""
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", force_mode="CUSTOMER", caller_scope="customer",
+        )
+        cmd = mock_run.call_args[0][0]
+        if server.HERMES_RUNNER_MODEL:
+            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
+        self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
+
+
 class TestParseRunRequest(unittest.TestCase):
     """Unit tests against the real request-validation function do_POST
     calls — not a reimplementation of its logic."""
 
-    def test_read_only_with_session_id_rejected(self):
+    def test_read_only_with_unknown_session_id_rejected(self):
+        """2026-08-13: read_only + hermes_session_id is now conditionally
+        allowed (see _is_readonly_originated_session), but the original
+        2026-08-04 protection is unchanged for any session_id this server
+        did NOT itself already return from a prior read_only call --
+        including an interactive/BUILD/RUN session someone might guess or
+        copy from elsewhere."""
         body = {"read_only": True, "hermes_session_id": "some-existing-session", "message": "hi"}
-        _, _, _, force_mode, _, err = server._parse_run_request(body)
+        _, _, _, force_mode, _, _, err = server._parse_run_request(body)
         self.assertIsNotNone(err)
-        self.assertIn("read_only", err)
+        self.assertIsNone(force_mode)
+
+    def test_read_only_with_own_originated_session_id_allowed(self):
+        """The one new case: a session_id this server itself registered
+        via _register_readonly_session (i.e. actually returned from a
+        prior read_only call) may now be resumed under read_only too."""
+        server._register_readonly_session("own-readonly-session")
+        try:
+            body = {"read_only": True, "hermes_session_id": "own-readonly-session", "message": "hi"}
+            session_id, _, _, force_mode, _, _, err = server._parse_run_request(body)
+            self.assertIsNone(err)
+            self.assertEqual(force_mode, "READ")
+            self.assertEqual(session_id, "own-readonly-session")
+        finally:
+            server._readonly_originated_sessions.pop("own-readonly-session", None)
+
+    def test_readonly_session_allowlist_expires(self):
+        """TTL backstop: an entry older than _READONLY_SESSION_TTL_SECONDS
+        is pruned lazily and no longer resumable under read_only."""
+        server._register_readonly_session("stale-readonly-session")
+        try:
+            with server._readonly_session_lock:
+                server._readonly_originated_sessions["stale-readonly-session"] = (
+                    server.time.monotonic() - server._READONLY_SESSION_TTL_SECONDS - 1
+                )
+            self.assertFalse(server._is_readonly_originated_session("stale-readonly-session"))
+            body = {"read_only": True, "hermes_session_id": "stale-readonly-session", "message": "hi"}
+            _, _, _, force_mode, _, _, err = server._parse_run_request(body)
+            self.assertIsNotNone(err)
+            self.assertIsNone(force_mode)
+        finally:
+            server._readonly_originated_sessions.pop("stale-readonly-session", None)
 
     def test_read_only_without_session_id_forces_read_mode(self):
         body = {"read_only": True, "message": "hi"}

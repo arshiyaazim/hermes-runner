@@ -61,6 +61,21 @@ session_id/progress) — pass that same id back on every subsequent call via
 
 Requests for the same hermes_session_id are serialized (a lock per id) so
 two overlapping messages to the same Hermes conversation can't race.
+
+read_only + hermes_session_id (2026-08-13, Bridge1 Hermes Control Channel
+follow-up): a read_only call MAY now pass a hermes_session_id, but ONLY one
+this server itself already returned from a prior read_only call --
+_readonly_originated_sessions (below) is the in-memory allowlist that makes
+this enforceable. Any hermes_session_id not in that allowlist is still
+rejected exactly as before -- the original 2026-08-04 guarantee ("a
+relayed request can never be pointed at, or silently continue, an existing
+(possibly elevated) interactive session") is unchanged; this only adds the
+ability for a read_only caller to resume a conversation *of its own
+making*, never anyone else's. The allowlist is process-local and resets on
+restart -- a read-only conversation's continuity does not survive a
+hermes-runner restart, only its own on-disk Hermes session does (a fresh
+--resume attempt after a restart would simply be rejected here and the
+caller falls back to starting a new conversation, not an error state).
 """
 
 import datetime
@@ -123,6 +138,37 @@ HERMES_RUNNER_MODEL = os.environ.get("HERMES_RUNNER_MODEL", "gemini/gemini-3.1-f
 # added, and resolution falls through to config.yaml's model.provider
 # exactly as it does now.
 HERMES_RUNNER_PROVIDER = os.environ.get("HERMES_RUNNER_PROVIDER", "")
+
+# ── WhatsApp Admin relay model override (2026-08-12) ────────────────────────
+# HERMES_RUNNER_MODEL/PROVIDER above are process-wide -- every /run caller
+# through this shim gets them, including modules.hermes_dispatch's
+# caller_scope="customer" traffic (currently flag-gated off, but not
+# structurally prevented from sharing this env var once enabled) and any
+# other future caller. That's too broad a blast radius for a change scoped
+# to exactly one conversation: the Admin's WhatsApp<->Hermes relay
+# (modules.admin_directives.router._deliver_hermes_reply), which is the
+# only call site in the codebase that sends readonly_key="readonly:
+# whatsapp_relay" (see WHATSAPP_ADMIN_READONLY_KEY below). Investigation
+# (2026-08-12 capability-expansion report) found gemini-3.1-flash-lite --
+# HERMES_RUNNER_MODEL's current default -- fails deferred-tool-call
+# argument generation on ordinary fazle-core queries; MiniMax-M3 is
+# already a configured, credentialed fallback_providers entry in
+# ~/.hermes/config.yaml (provider="minimax", native plugin, MINIMAX_API_KEY
+# already present in ~/.hermes/.env -- no new credential). Rather than
+# widen the blast radius by repointing HERMES_RUNNER_MODEL itself, or
+# invent a new call-shape/endpoint, this reuses the exact same
+# "-m"/"--provider" override mechanism, keyed on the readonly_key the
+# WhatsApp relay already sends today (no fazle-core change needed at all).
+# Empty by default would fall through to HERMES_RUNNER_MODEL/PROVIDER
+# above -- but the whole point of this block is the WhatsApp relay no
+# longer using gemini-3.1-flash-lite, so it defaults ON to MiniMax-M3.
+WHATSAPP_ADMIN_READONLY_KEY = "readonly:whatsapp_relay"
+HERMES_RUNNER_WHATSAPP_ADMIN_MODEL = os.environ.get(
+    "HERMES_RUNNER_WHATSAPP_ADMIN_MODEL", "MiniMax-M3"
+)
+HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER = os.environ.get(
+    "HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER", "minimax"
+)
 
 # ── Timeout chain (2026-08-06, corrected after a real incident) ────────────
 # Every hop between the browser and this process has its own timeout, and
@@ -263,6 +309,66 @@ _mode_lock = threading.Lock()
 AUDIT_LOG_FILE = os.environ.get(
     "HERMES_MODE_AUDIT_LOG", os.path.expanduser("~/hermes-runner/mode_audit.log")
 )
+
+# ── Read-only session continuity allowlist (2026-08-13) ─────────────────
+# Bridge1 Hermes Control Channel follow-up: see the module docstring's
+# "read_only + hermes_session_id" section for the security property this
+# preserves. session_id -> monotonic time it was registered; pruned lazily
+# (no background thread) whenever checked. TTL is deliberately generous
+# (1h) -- this is only a backstop; the real "is this conversation still
+# fresh" decision belongs to the caller (fazle-core), which uses its own,
+# shorter idle TTL before it will even attempt to pass a session_id back
+# here at all.
+_READONLY_SESSION_TTL_SECONDS = 3600
+_readonly_session_lock = threading.Lock()
+_readonly_originated_sessions: dict[str, float] = {}
+
+
+def _register_readonly_session(session_id: str) -> None:
+    if not session_id:
+        return
+    with _readonly_session_lock:
+        _readonly_originated_sessions[session_id] = time.monotonic()
+
+
+def _is_readonly_originated_session(session_id: str) -> bool:
+    if not session_id:
+        return False
+    now = time.monotonic()
+    with _readonly_session_lock:
+        # Lazy prune: cheap, and only ever runs on the (rare) path where
+        # someone is actually asking about session continuity at all.
+        expired = [
+            sid for sid, ts in _readonly_originated_sessions.items()
+            if now - ts > _READONLY_SESSION_TTL_SECONDS
+        ]
+        for sid in expired:
+            del _readonly_originated_sessions[sid]
+        return session_id in _readonly_originated_sessions
+
+
+# ── Durable subprocess diagnostics (2026-08-13) ──────────────────────────
+# _log() below only ever reaches journald (see its own docstring) --
+# journald's --user retention turned out too short to root-cause 2 real
+# unexplained hangs found during the 2026-08-13 live capability assessment
+# (request received + subprocess started were logged, but neither a
+# "subprocess done" nor a "subprocess TIMEOUT" line survived long enough to
+# inspect). This is a second, durable, append-only sink for the same
+# request-lifecycle events (never message/reply content, matching _log()'s
+# own privacy commitment) so a future hang is diagnosable after the fact
+# without racing journald's rotation.
+DIAG_LOG_FILE = os.environ.get(
+    "HERMES_SUBPROCESS_DIAG_LOG", os.path.expanduser("~/hermes-runner/subprocess_diag.log")
+)
+
+
+def _append_diag(entry: dict) -> None:
+    entry = {"ts": _now().isoformat(timespec="milliseconds"), **entry}
+    try:
+        with open(DIAG_LOG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass  # diagnostics must never block or fail a real request
 
 
 def _now():
@@ -569,7 +675,17 @@ def _run_hermes_once(cmd, env, timeout_seconds, session_id=None, persona=None):
     """The one subprocess.run() attempt at the `hermes chat` CLI, with
     before/after diagnostic logging (2026-08-06) so a hang shows its actual
     timing instead of pure silence until the caller's own timeout error.
-    Returns (CompletedProcess | None, timed_out).
+    Returns (CompletedProcess | None, timed_out, crash_detail | None).
+
+    crash_detail (2026-08-13): previously, anything subprocess.run() itself
+    could raise OUTSIDE TimeoutExpired (e.g. OSError starting the child)
+    propagated fully uncaught through run_hermes() and do_POST -- no clean
+    {"error": ...} response, no durable record, and from the caller's side
+    (fazle-core) indistinguishable from the 2 unexplained hangs found in
+    the 2026-08-13 capability assessment (request accepted, subprocess
+    start logged, then silence). Caught and logged (both journald and the
+    new durable diag file) here, and now surfaces as a real, specific
+    error message instead of a broken response.
 
     session_id/persona (2026-08-10): tagged onto every log line here so a
     specific stuck/failed browser turn can actually be correlated against
@@ -590,6 +706,7 @@ def _run_hermes_once(cmd, env, timeout_seconds, session_id=None, persona=None):
     tag = f"session={session_id or 'new'} persona={persona or '?'}"
     started = time.monotonic()
     _log(f"subprocess start {tag} timeout={timeout_seconds}s")
+    _append_diag({"event": "subprocess_start", "session": session_id or "new", "timeout_s": timeout_seconds})
     try:
         result = subprocess.run(
             cmd,
@@ -609,25 +726,66 @@ def _run_hermes_once(cmd, env, timeout_seconds, session_id=None, persona=None):
             f"subprocess TIMEOUT {tag} after {elapsed:.1f}s "
             f"partial_stdout={partial_out!r} partial_stderr={partial_err!r}"
         )
-        return None, True
+        _append_diag({
+            "event": "subprocess_timeout", "session": session_id or "new",
+            "elapsed_s": round(elapsed, 1),
+        })
+        return None, True, None
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        _log(f"subprocess ERROR {tag} after {elapsed:.1f}s: {exc!r}")
+        _append_diag({
+            "event": "subprocess_error", "session": session_id or "new",
+            "elapsed_s": round(elapsed, 1), "error": repr(exc),
+        })
+        return None, False, f"{type(exc).__name__}: {exc}"
     elapsed = time.monotonic() - started
     _log(f"subprocess done {tag} in {elapsed:.1f}s returncode={result.returncode}")
-    return result, False
+    _append_diag({
+        "event": "subprocess_done", "session": session_id or "new",
+        "elapsed_s": round(elapsed, 1), "returncode": result.returncode,
+    })
+    return result, False, None
 
 
-def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None):
+def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None, readonly_key=None):
     """force_mode (Phase 4, 2026-08-04): when set, use that mode's toolset
     for THIS call only — does not read or write the persisted mode file, so
     it can never affect (or be affected by) the web UI's own current mode.
-    Used by the WhatsApp->Hermes relay to hard-lock every relayed request
-    to READ regardless of what mode the interactive web session is in,
-    so a WhatsApp message can never reach BUILD/RUN capability.
+    A caller sending read_only=true (force_mode="READ" here) gets this
+    hard lock regardless of what mode is currently persisted.
+
+    UPDATED, Full-authority Phase 1 (2026-08-13, Owner-approved): whether a
+    WhatsApp-originated call sends read_only=true at all is now the
+    caller's (fazle-core's) own choice, not a blanket property of this
+    function or this endpoint -- fazle-core's Phase 5B alert investigations
+    (unattended, scheduled) always still send it; fazle-core's live,
+    human-initiated Super Admin relay turn (Bridge1/Bridge2 Hermes Control
+    Channel) now deliberately does not, so force_mode below resolves to
+    None and this call falls through to read_current_mode() exactly like
+    the interactive web UI -- see fazle-core's
+    modules.admin_directives.router._call_hermes_readonly's own docstring
+    for the full rationale and the gates that still apply upstream of this
+    function (RBAC superadmin, exact admin phone, dedicated channel, and
+    mode itself still only ever elevated via the existing `/api/hermes/
+    mode` web endpoint -- nothing reachable from WhatsApp can elevate mode
+    itself).
 
     caller_scope (Phase 1, 2026-08-12): "customer" swaps SYSTEM_PREAMBLE
     for CUSTOMER_SYSTEM_PREAMBLE and skips NEW_CONVERSATION_GREETING and
     persona selection entirely — see do_POST/_parse_run_request for the
     auth/validation that guarantees caller_scope="customer" only ever
-    arrives paired with force_mode="CUSTOMER"."""
+    arrives paired with force_mode="CUSTOMER".
+
+    readonly_key (2026-08-12, WhatsApp Admin relay model override): used
+    ONLY to select which model/provider override applies (see
+    WHATSAPP_ADMIN_READONLY_KEY below) -- does not affect toolsets,
+    preamble, or locking (that's still readonly_key's original,
+    unmodified purpose in do_POST/_lock_key_for). A value other than
+    exactly "readonly:whatsapp_relay" (including None, and including
+    every other caller's own readonly_key such as Phase 5B's
+    "readonly:job:<name>") falls through to HERMES_RUNNER_MODEL/PROVIDER,
+    unchanged from today's behavior."""
     mode = force_mode if force_mode in MODE_TOOLSETS else read_current_mode()
     toolsets = MODE_TOOLSETS[mode]
     if caller_scope == "customer":
@@ -648,21 +806,27 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
         "tool",
         "-Q",
     ]
-    if HERMES_RUNNER_MODEL:
-        cmd += ["-m", HERMES_RUNNER_MODEL]
-    if HERMES_RUNNER_PROVIDER:
-        cmd += ["--provider", HERMES_RUNNER_PROVIDER]
+    if readonly_key == WHATSAPP_ADMIN_READONLY_KEY:
+        model, provider = HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER
+    else:
+        model, provider = HERMES_RUNNER_MODEL, HERMES_RUNNER_PROVIDER
+    if model:
+        cmd += ["-m", model]
+    if provider:
+        cmd += ["--provider", provider]
     if hermes_session_id:
         cmd += ["--resume", hermes_session_id]
 
     # See STALE_CALL_TIMEOUT_SECONDS' definition above for why this is set.
     env = {**os.environ, "HERMES_API_CALL_STALE_TIMEOUT": STALE_CALL_TIMEOUT_SECONDS}
 
-    result, timed_out = _run_hermes_once(
+    result, timed_out, crash_detail = _run_hermes_once(
         cmd, env, TIMEOUT_SECONDS, session_id=hermes_session_id, persona=persona
     )
     if timed_out:
         return None, None, "Hermes did not respond in time", mode
+    if crash_detail is not None:
+        return None, None, f"Hermes subprocess failed to run: {crash_detail}", mode
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-2000:]
@@ -673,6 +837,18 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
     reply = (result.stdout or "").strip()
     if not reply:
         return None, new_session_id, "Hermes returned an empty reply", mode
+
+    # Read-only session continuity (2026-08-13): register the session this
+    # call resolved to as one THIS server originated under read_only, so a
+    # future read_only call may legitimately --resume it. Only for mode ==
+    # "READ" -- BUILD/RUN/CUSTOMER turns never register here, matching the
+    # allowlist's whole purpose (see module docstring). Registered on every
+    # successful READ turn, whether hermes_session_id was already set
+    # (continuing) or None (starting) -- both cases produce a real
+    # new_session_id at this point.
+    if mode == "READ" and new_session_id:
+        _register_readonly_session(new_session_id)
+
     return reply, new_session_id, None, mode
 
 
@@ -759,9 +935,9 @@ def _parse_run_request(body):
             f"unknown caller_scope: {caller_scope!r}"
 
     read_only = bool(body.get("read_only"))
-    if read_only and hermes_session_id:
+    if read_only and hermes_session_id and not _is_readonly_originated_session(hermes_session_id):
         return hermes_session_id, message, persona, None, readonly_key, caller_scope, \
-            "read_only requests may not pass hermes_session_id"
+            "read_only requests may only resume a session this server itself started under read_only"
     force_mode = "READ" if read_only else None
     return hermes_session_id, message, persona, force_mode, readonly_key, caller_scope, None
 
@@ -852,6 +1028,11 @@ class Handler(BaseHTTPRequestHandler):
         # exists specifically so "did the request even arrive" is answerable
         # from journald alone.
         _log(f"/run request received session={hermes_session_id or 'new'} persona={persona or '?'}")
+        _append_diag({
+            "event": "request_received", "session": hermes_session_id or "new",
+            "force_mode": force_mode, "readonly_key": readonly_key, "caller_scope": caller_scope,
+        })
+        req_started = time.monotonic()
 
         lock_key = _lock_key_for(hermes_session_id, force_mode, readonly_key)
         lock = _lock_for(lock_key)
@@ -862,6 +1043,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             reply, new_session_id, error, mode = run_hermes(
                 hermes_session_id, message, persona, force_mode=force_mode, caller_scope=caller_scope,
+                readonly_key=readonly_key,
             )
         finally:
             lock.release()
@@ -869,6 +1051,21 @@ class Handler(BaseHTTPRequestHandler):
         if force_mode == "READ":
             import sys
             sys.stderr.write(f"[whatsapp-relay] mode=READ (forced) session={new_session_id} ok={error is None}\n")
+
+        # 2026-08-13: closes the request-lifecycle diagnostic loop --
+        # request_received (above) always has a matching request_completed
+        # or request_failed line, with the elapsed wall time INCLUDING lock
+        # wait, not just the subprocess's own elapsed_s (subprocess_done/
+        # subprocess_timeout/subprocess_error, logged inside run_hermes).
+        # A hang that never reaches either subprocess-level event (e.g. a
+        # deadlock acquiring the lock itself) is now still visible as a
+        # request_received with no matching completion line at all.
+        _append_diag({
+            "event": "request_failed" if error else "request_completed",
+            "session": new_session_id or hermes_session_id or "new",
+            "elapsed_s": round(time.monotonic() - req_started, 1),
+            "error": error,
+        })
 
         if error:
             return self._send(502, {"error": error, "hermes_session_id": new_session_id, "mode": mode})

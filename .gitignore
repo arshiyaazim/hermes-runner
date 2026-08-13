@@ -3,6 +3,7 @@ __pycache__/
 .env
 current_mode.txt
 mode_audit.log
+subprocess_diag.log
 
 # Timestamped backups from manual experimentation (2026-08-12 cleanup) --
 # .env is already gitignored above; these dated variants weren't covered
