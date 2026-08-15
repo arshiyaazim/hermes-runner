@@ -170,18 +170,19 @@ HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER = os.environ.get(
     "HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER", "minimax"
 )
 
-# ── Timeout chain (2026-08-06, corrected after a real incident) ────────────
+# ── Timeout chain (2026-08-06, corrected after a real incident; widened
+# 2026-08-14 for opencode_dispatch headroom -- see P2 handoff) ─────────────
 # Every hop between the browser and this process has its own timeout, and
 # they must be in *strictly decreasing* order working outward, so whichever
 # layer is closest to the actual failure gets to report it first with a
 # real, specific error -- otherwise an outer layer times out first and all
 # the caller sees is a generic "unreachable"/"canceled" with no information.
 # Chain, closest to farthest (each must be less than the next):
-#   this process (below)         < 150s
-#   assistant-backend fetch()      = 180s  (hermes.js, AbortSignal.timeout)
-#   nginx /hermes-internal/        = 200s  (assistant.iamazim.com vhost)
-#   nginx /api/                    = 220s  (assistant.iamazim.com vhost)
-#   browser fetch()                = none  (frontend api.js, no AbortSignal)
+#   this process (below)                     < 300s
+#   fazle-core admin_directives (WhatsApp)      = 330s  (router.py, httpx.AsyncClient timeout, calls 127.0.0.1:8093 directly, no nginx hop)
+#   assistant-backend fetch() (web UI)          = 330s  (hermes.js, AbortSignal.timeout)
+#   nginx /api/hermes/ (web UI only)            = 350s  (assistant.iamazim.com vhost -- deliberately its own location block, NOT the general /api/ 220s block, so other routes are unaffected)
+#   browser fetch() (web UI)                    = 380s  (frontend api.js, REQUEST_TIMEOUT_MS)
 # Previously this was 170s, which was fine on its own (170 < 180, 10s
 # margin) -- broken by a since-reverted retry-on-timeout that made this
 # process's own worst case up to 340s. Confirmed live via journalctl +
@@ -194,7 +195,20 @@ HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER = os.environ.get(
 # to 150s (30s of margin, not 10s) specifically so this process always
 # wins that race and the caller gets a real, specific error body instead
 # of a generic upstream-timeout one.
-TIMEOUT_SECONDS = int(os.environ.get("HERMES_RUN_TIMEOUT", "150"))
+#
+# Raised again 150s -> 300s on 2026-08-14: opencode_dispatch (a tool this
+# process's own `hermes chat` subprocess can call) nests fazle-mcp's own
+# 155s client timeout (fazle-mcp/opencode_tools.py::_PROMPT_TIMEOUT_S,
+# itself waiting on opencode.js's 150s server-side poll deadline) *inside*
+# this timeout -- so 150s here left zero room for Hermes's own reasoning
+# before/after that tool call, and was structurally near-guaranteed to
+# time out on any real opencode_dispatch call. This entire chain (this
+# process's 300s through the browser's 380s) was raised in lockstep so the
+# strictly-increasing invariant above still holds -- see
+# HANDOFF_P2_TIMEOUT_FIX_2026-08-14.md and the corrected follow-up plan
+# for the full analysis (raising this process's timeout alone, without the
+# outward chain, would have reproduced the exact 2026-08-06 incident).
+TIMEOUT_SECONDS = int(os.environ.get("HERMES_RUN_TIMEOUT", "300"))
 
 # ── Stale-call watchdog fix (2026-08-06 root-cause fix, see incident write-
 # up "Hermes web chat: did not respond in time") ────────────────────────────
