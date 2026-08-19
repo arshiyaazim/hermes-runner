@@ -652,6 +652,25 @@ AUTONOMY_ADDENDUM = (
     "inventing a plausible-sounding tool name.]\n\n"
 )
 
+# Persistent task-state + diff-level action approval (2026-08-19, Owner-
+# directed follow-on to the P0-P2 pass and the BUILD/RUN/business-action
+# capability audit — modules.hermes_tasks in fazle-core). Kept as its own
+# constant (not folded into AUTONOMY_ADDENDUM) so it can be dropped from
+# the prompt independently later if this pass is ever rolled back without
+# touching the tool-reliability language above it.
+TASK_APPROVAL_ADDENDUM = (
+    "[Before any file mutation, git commit, deploy, migration, restart, or "
+    "production write — including your own direct BUILD/RUN-mode file "
+    "edits — call propose_action first. This is a named requirement, not "
+    "optional, even though nothing stops you from skipping it. A general "
+    "'yes'/'go ahead' is never approval for a proposed action — only an "
+    "explicit 'APPROVE ACTION <id>' naming that exact id counts, same "
+    "discipline as every other Tier C/D tool. At the start of a new "
+    "conversation, check get_tasks(owner=\"earth\") for unfinished "
+    "IN_PROGRESS/WAITING_APPROVAL/VERIFYING work before assuming a fresh "
+    "start — tasks persist across conversations.]\n\n"
+)
+
 # Prepended to SYSTEM_PREAMBLE (2026-08-10), only for the first turn of a
 # brand-new conversation — see the `if not hermes_session_id:` branch in
 # run_hermes() below, which reuses the session-id check already needed for
@@ -979,7 +998,7 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
         preamble = CUSTOMER_SYSTEM_PREAMBLE
     else:
         persona_text = PERSONAS.get(persona, PERSONAS[DEFAULT_PERSONA])
-        preamble = persona_text + "\n\n" + SYSTEM_PREAMBLE + "\n\n" + AUTONOMY_ADDENDUM
+        preamble = persona_text + "\n\n" + SYSTEM_PREAMBLE + "\n\n" + AUTONOMY_ADDENDUM + "\n\n" + TASK_APPROVAL_ADDENDUM
         if not hermes_session_id:
             preamble = NEW_CONVERSATION_GREETING + preamble
     cmd = [
