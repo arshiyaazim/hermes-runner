@@ -623,6 +623,26 @@ SYSTEM_PREAMBLE = (
     "ask.]\n\n"
 )
 
+# Autonomy-policy addendum (2026-08-19) — condensed from core/
+# HERMES_AUTONOMY_POLICY_2026-08-19.md (9,368 chars, ~4x SYSTEM_PREAMBLE —
+# too large to inject verbatim into a prompt resent every turn). This is
+# only the operationally load-bearing summary: a live 2026-08-19 transcript
+# showed Hermes re-asking permission for plain reads three times in one
+# investigation, including once after Boss had already said "proceed" —
+# SYSTEM_PREAMBLE's own read-tools-need-no-confirmation line (above) existed
+# but wasn't specific enough to stop the loop in practice. Full tier tables
+# (which tool is A/B/C/D) live in the source doc, not duplicated here.
+AUTONOMY_ADDENDUM = (
+    "[Tier-A reads (get_*, audit_*, resolve_identity, classify_intent, "
+    "list_*, lookup_*) never need a yes/no first — call them freely. Once "
+    "Boss gives one go-ahead for an investigation, keep pursuing every "
+    "remaining safe read until you hit a real wall (not your own tool-call "
+    "mistake) before asking again. Never treat a fabricated or guessed "
+    "identifier as a real result — retry with the exact known value or "
+    "ask, never invent one. Only Tier C/D writes (mutations, sends, "
+    "financial actions) need explicit confirmation.]\n\n"
+)
+
 # Prepended to SYSTEM_PREAMBLE (2026-08-10), only for the first turn of a
 # brand-new conversation — see the `if not hermes_session_id:` branch in
 # run_hermes() below, which reuses the session-id check already needed for
@@ -674,9 +694,12 @@ PERSONAS = {
     # Kept as a NAMED persona (not a rewrite of "helpful") so the plain, dry
     # tone stays selectable.
     "devoted": (
-        "You are Hermes — Boss's devoted guard-dog \U0001F43E: honest, "
-        "evidence-first, safety-first. You joke around, but you never leak "
-        "secrets and you never chew the wiring (no destructive actions)."
+        "You are Earth — Boss's devoted co-worker: honest, evidence-first, "
+        "safety-first. Talk like a real colleague, not a script — vary your "
+        "phrasing, never repeat the same answer verbatim for a different "
+        "question, and never pad replies with emoji or decorative symbols. "
+        "You joke around, but you never leak secrets and you never take "
+        "destructive action without being asked."
     ),
     "helpful": "You are a helpful, friendly AI assistant.",
     "concise": "You are a concise assistant. Keep responses brief and to the point.",
@@ -694,6 +717,53 @@ PERSONAS = {
     "hype": "YOOO LET'S GOOOO!!! 🔥🔥🔥 I am SO PUMPED to help you today! Every question is AMAZING and we're gonna CRUSH IT together! This is gonna be LEGENDARY! ARE YOU READY?! LET'S DO THIS! 💪😤🚀",
 }
 DEFAULT_PERSONA = "devoted"  # was "helpful" until Charter v1.1, 2026-08-15
+
+# Display labels for the /personas metadata route (Task 3, 2026-08-16 —
+# mirror-drift removal). hermes-runner is now the single source of truth
+# for this admin integration's persona list; assistant-platform's frontend
+# fetches this instead of hardcoding its own copy. Deliberately UI
+# metadata only (key + label) — never the actual persona prompt text
+# (PERSONAS values above), which the frontend has no legitimate need to
+# see and which would otherwise leak operational prompt-engineering detail
+# through a browser-reachable endpoint. No "(default)" suffix baked into
+# any label — the /personas response reports `default` as its own field,
+# so the frontend composes "(default)" dynamically instead of this dict
+# needing an edit every time the default changes (it already changed once,
+# 2026-08-15, "helpful" -> "devoted").
+PERSONA_LABELS = {
+    "devoted": "Devoted",
+    "helpful": "Helpful",
+    "concise": "Concise",
+    "technical": "Technical",
+    "creative": "Creative",
+    "teacher": "Teacher",
+    "kawaii": "Kawaii",
+    "catgirl": "Catgirl",
+    "pirate": "Pirate",
+    "shakespeare": "Shakespeare",
+    "surfer": "Surfer",
+    "noir": "Noir",
+    "uwu": "UwU",
+    "philosopher": "Philosopher",
+    "hype": "Hype",
+}
+
+
+def build_personas_response():
+    """UI metadata for the /personas route — key + display label + which
+    key is default. Factored out of Handler.do_GET (matching the existing
+    read_mode_state()/_handle_audit() convention: HTTP dispatch stays thin,
+    the actual logic is a plain testable function) so this can be unit
+    tested without spinning up a real HTTP server. Deliberately returns
+    ONLY key/label/default — never a PERSONAS dict value (the actual
+    prompt text) and never anything from SYSTEM_PREAMBLE."""
+    return {
+        "personas": [
+            {"key": key, "label": PERSONA_LABELS.get(key, key.title())}
+            for key in PERSONAS
+        ],
+        "default": DEFAULT_PERSONA,
+    }
 
 _session_locks = {}
 _session_locks_guard = threading.Lock()
@@ -820,7 +890,40 @@ def _run_hermes_once(cmd, env, timeout_seconds, session_id=None, persona=None):
         "event": "subprocess_done", "session": session_id or "new",
         "elapsed_s": round(elapsed, 1), "returncode": result.returncode,
     })
+    _record_schema_probe_halts(result.stderr or "", session_id)
     return result, False, None
+
+
+# 2026-08-16 (observability follow-up, see agent/tool_guardrails.py and
+# run_agent.py's own comments in the hermes-agent repo): the deferred-call
+# validation gap this hard-stop guards against is closed and tested
+# (ae4551f2c) -- the underlying model habit that trips it (repeatedly
+# observed against opencode_dispatch specifically) is not fixed, is out of
+# scope for that commit, and remains a live issue. hermes-agent's own
+# agent/tool_guardrails.py is deliberately side-effect-free by design (see
+# its module docstring), so it can't log this itself -- run_agent.py logs a
+# structured "[schema_probe_failure_halt] tool=... count=..." warning via
+# Python's stdlib logging, which (no custom handler configured in the CLI
+# for this logger) reaches this subprocess's stderr, exactly like the
+# existing partial_stdout/partial_stderr capture on timeout/error above.
+# This scans that same already-captured stderr for the marker and appends
+# it to the existing subprocess_diag.log via the same _append_diag() this
+# file already uses for subprocess_start/timeout/error/done -- no new log
+# file, no new capture mechanism, no change to hermes-agent's validation
+# code.
+_SCHEMA_PROBE_HALT_RE = re.compile(
+    r"\[schema_probe_failure_halt\]\s+tool=(\S+)\s+count=(\d+)"
+)
+
+
+def _record_schema_probe_halts(stderr_text: str, session_id) -> None:
+    for tool_name, count in _SCHEMA_PROBE_HALT_RE.findall(stderr_text):
+        _append_diag({
+            "event": "schema_probe_failure_halt",
+            "session": session_id or "new",
+            "tool": tool_name,
+            "count": int(count),
+        })
 
 
 def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None, readonly_key=None):
@@ -867,7 +970,7 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
         preamble = CUSTOMER_SYSTEM_PREAMBLE
     else:
         persona_text = PERSONAS.get(persona, PERSONAS[DEFAULT_PERSONA])
-        preamble = persona_text + "\n\n" + SYSTEM_PREAMBLE
+        preamble = persona_text + "\n\n" + SYSTEM_PREAMBLE + "\n\n" + AUTONOMY_ADDENDUM
         if not hermes_session_id:
             preamble = NEW_CONVERSATION_GREETING + preamble
     cmd = [
@@ -899,19 +1002,19 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
         cmd, env, TIMEOUT_SECONDS, session_id=hermes_session_id, persona=persona
     )
     if timed_out:
-        return None, None, "Hermes did not respond in time", mode
+        return None, None, "Earth did not respond in time", mode
     if crash_detail is not None:
-        return None, None, f"Hermes subprocess failed to run: {crash_detail}", mode
+        return None, None, f"Earth subprocess failed to run: {crash_detail}", mode
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[-2000:]
-        return None, None, f"Hermes exited with an error: {detail}", mode
+        return None, None, f"Earth exited with an error: {detail}", mode
 
     match = SESSION_ID_RE.search(result.stderr or "")
     new_session_id = match.group(1) if match else hermes_session_id
     reply = (result.stdout or "").strip()
     if not reply:
-        return None, new_session_id, "Hermes returned an empty reply", mode
+        return None, new_session_id, "Earth returned an empty reply", mode
 
     # Read-only session continuity (2026-08-13): register the session this
     # call resolved to as one THIS server originated under read_only, so a
@@ -1035,6 +1138,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(401, {"error": "unauthorized"})
             state = read_mode_state()
             return self._send(200, {**state, "modes": MODES})
+        if self.path == "/personas":
+            # Task 3 (2026-08-16): UI metadata only — key + display label +
+            # which key is default. Never the persona prompt text (PERSONAS
+            # dict values) or SYSTEM_PREAMBLE. Same Bearer-secret gate as
+            # every other GET here — this reuses the existing auth
+            # convention rather than inventing a public/unauthenticated
+            # route, per the explicit "don't create a public administrative
+            # endpoint by accident" boundary.
+            auth = self.headers.get("Authorization", "")
+            if not RUNNER_SECRET or auth != f"Bearer {RUNNER_SECRET}":
+                return self._send(401, {"error": "unauthorized"})
+            return self._send(200, build_personas_response())
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
