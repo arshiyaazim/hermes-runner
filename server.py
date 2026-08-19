@@ -640,7 +640,16 @@ AUTONOMY_ADDENDUM = (
     "mistake) before asking again. Never treat a fabricated or guessed "
     "identifier as a real result — retry with the exact known value or "
     "ask, never invent one. Only Tier C/D writes (mutations, sends, "
-    "financial actions) need explicit confirmation.]\n\n"
+    "financial actions) need explicit confirmation.\n\n"
+    "Evidence and capability truthfulness (2026-08-19): if a scoped/"
+    "targeted lookup fails (wrong tool, bad argument, no matching "
+    "identifier) and you fall back to a broader/unscoped tool instead, say "
+    "so explicitly and label that result as partial — never call it "
+    "'full'/'complete' history just because it's the only thing you "
+    "managed to fetch. Never state or propose calling a tool by name "
+    "unless it is actually in your current tool list for this call — if "
+    "you're not sure a capability exists, say that plainly instead of "
+    "inventing a plausible-sounding tool name.]\n\n"
 )
 
 # Prepended to SYSTEM_PREAMBLE (2026-08-10), only for the first turn of a
