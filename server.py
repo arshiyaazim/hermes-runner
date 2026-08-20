@@ -191,6 +191,26 @@ HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER = os.environ.get(
 HERMES_RUNNER_BUILD_MODEL = os.environ.get("HERMES_RUNNER_BUILD_MODEL", "MiniMax-M3")
 HERMES_RUNNER_BUILD_PROVIDER = os.environ.get("HERMES_RUNNER_BUILD_PROVIDER", "minimax")
 
+# ── READ mode model override (2026-08-21, Owner-directed) ──────────────────
+# Same reasoning and mechanism as the BUILD/RUN override directly above.
+# READ's own toolset (MODE_TOOLSETS["READ"] above) includes "fazle-core" --
+# the same MCP tool surface BUILD/RUN calls, and the same one the
+# gemini-3.1-flash-lite deferred-tool-call defect
+# (project_hermes_toolcall_reason_bug_audit_20260811) hits. Live-reproduced
+# same day: a real READ-mode /run call asked to invoke the new
+# verify_employee_claim tool with an explicit claimed_name repeatedly sent
+# {"claimed_name": null, "claimed_role": null} instead of the given values,
+# even after re-prompting -- the identical failure class already fixed for
+# BUILD/RUN and the WhatsApp admin relay, just never closed for READ mode
+# itself (the mode with by far the widest traffic, since it's every
+# ordinary Chat/dashboard query, not just elevated build/admin work).
+# CUSTOMER mode is deliberately NOT covered here -- its toolset has zero
+# fazle-core tool access (see MODE_TOOLSETS["CUSTOMER"]'s own comment), so
+# this defect class cannot occur there regardless of model, and widening
+# scope beyond what's actually affected isn't warranted.
+HERMES_RUNNER_READ_MODEL = os.environ.get("HERMES_RUNNER_READ_MODEL", "MiniMax-M3")
+HERMES_RUNNER_READ_PROVIDER = os.environ.get("HERMES_RUNNER_READ_PROVIDER", "minimax")
+
 # ── Timeout chain (2026-08-06, corrected after a real incident; widened
 # 2026-08-14 for opencode_dispatch headroom -- see P2 handoff) ─────────────
 # Every hop between the browser and this process has its own timeout, and
@@ -1088,6 +1108,8 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
         model, provider = HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER
     elif mode in ("BUILD", "RUN"):
         model, provider = HERMES_RUNNER_BUILD_MODEL, HERMES_RUNNER_BUILD_PROVIDER
+    elif mode == "READ":
+        model, provider = HERMES_RUNNER_READ_MODEL, HERMES_RUNNER_READ_PROVIDER
     else:
         model, provider = HERMES_RUNNER_MODEL, HERMES_RUNNER_PROVIDER
     if model:

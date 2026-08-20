@@ -177,16 +177,22 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
         self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER, "minimax")
 
     @patch("server.subprocess.run")
-    def test_no_readonly_key_keeps_default_model(self, mock_run):
+    def test_no_readonly_key_selects_read_override_not_whatsapp_override(self, mock_run):
+        """2026-08-21: READ mode without the WhatsApp-relay readonly_key now
+        selects HERMES_RUNNER_READ_MODEL (see TestRunHermesReadModeOverride
+        in this file) instead of the bare HERMES_RUNNER_MODEL default --
+        this test's job is only to confirm it's NOT swept into the
+        WhatsApp-relay-only override, not to assert which non-WhatsApp
+        model it picks (that's the READ-override test class's job)."""
         mock_run.return_value = self._fake_result()
         server.run_hermes(None, "hello", "helpful", force_mode="READ")
         cmd = mock_run.call_args[0][0]
-        if server.HERMES_RUNNER_MODEL:
-            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
-        self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_READ_MODEL)
+        if server.HERMES_RUNNER_READ_MODEL != server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL:
+            self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
 
     @patch("server.subprocess.run")
-    def test_different_readonly_key_keeps_default_model(self, mock_run):
+    def test_different_readonly_key_selects_read_override_not_whatsapp_override(self, mock_run):
         """Phase 5B alert-investigation jobs use readonly:job:<name> — must
         NOT be swept into the WhatsApp-relay-only override."""
         mock_run.return_value = self._fake_result()
@@ -195,9 +201,9 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
             readonly_key="readonly:job:bridge_watchdog",
         )
         cmd = mock_run.call_args[0][0]
-        if server.HERMES_RUNNER_MODEL:
-            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
-        self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_READ_MODEL)
+        if server.HERMES_RUNNER_READ_MODEL != server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL:
+            self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
 
     @patch("server.subprocess.run")
     def test_customer_scope_keeps_default_model(self, mock_run):
@@ -332,14 +338,17 @@ class TestRunHermesBuildModeOverride(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_BUILD_PROVIDER)
 
     @patch("server.subprocess.run")
-    def test_read_mode_keeps_default_model_not_build_override(self, mock_run):
+    def test_read_mode_selects_read_override_not_build_override(self, mock_run):
+        """2026-08-21: READ mode now selects its own HERMES_RUNNER_READ_MODEL
+        override (see TestRunHermesReadModeOverride below) -- distinct from
+        the BUILD/RUN override, even though both currently default to the
+        same MiniMax-M3 value, because they are independently configurable
+        env vars for a reason (different traffic, different blast radius)."""
         mock_run.return_value = self._fake_result()
         server.run_hermes(None, "hello", "helpful", force_mode="READ")
         cmd = mock_run.call_args[0][0]
-        if server.HERMES_RUNNER_MODEL:
-            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
-        if server.HERMES_RUNNER_MODEL != server.HERMES_RUNNER_BUILD_MODEL:
-            self.assertNotIn(server.HERMES_RUNNER_BUILD_MODEL, cmd)
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_READ_MODEL)
+        self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_READ_PROVIDER)
 
     @patch("server.subprocess.run")
     def test_customer_scope_unaffected_by_build_override(self, mock_run):
@@ -360,6 +369,89 @@ class TestRunHermesBuildModeOverride(unittest.TestCase):
         mock_run.return_value = self._fake_result()
         server.run_hermes(
             None, "hello", "helpful", force_mode="BUILD",
+            readonly_key="readonly:whatsapp_relay",
+        )
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL)
+
+
+class TestRunHermesReadModeOverride(unittest.TestCase):
+    """2026-08-21: READ mode conversations (every ordinary Chat/dashboard
+    query with fazle-core tool access -- MODE_TOOLSETS["READ"] includes
+    "fazle-core") must select HERMES_RUNNER_READ_MODEL/PROVIDER instead of
+    HERMES_RUNNER_MODEL/PROVIDER's default gemini-3.1-flash-lite. Live
+    reproduction the same day: a real READ-mode /run call asked to invoke
+    verify_employee_claim with an explicit claimed_name repeatedly sent
+    {"claimed_name": null, "claimed_role": null} instead of the given
+    values -- the same deferred-tool-call defect already fixed for
+    BUILD/RUN and the WhatsApp admin relay
+    (project_hermes_toolcall_reason_bug_audit_20260811), just never closed
+    for READ mode itself. CUSTOMER mode must stay unaffected -- its
+    toolset has zero fazle-core tool access, so this defect class cannot
+    occur there regardless of model."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.mode_file = os.path.join(self.tmp_dir, "current_mode.txt")
+        self._mode_patch = patch.object(server, "MODE_FILE", self.mode_file)
+        self._mode_patch.start()
+
+    def tearDown(self):
+        self._mode_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _fake_result(self, stdout="reply text", stderr="session_id: abc123", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @patch("server.subprocess.run")
+    def test_read_mode_selects_read_override(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", force_mode="READ")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_READ_MODEL)
+        self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_READ_PROVIDER)
+        self.assertEqual(server.HERMES_RUNNER_READ_MODEL, "MiniMax-M3")
+        self.assertEqual(server.HERMES_RUNNER_READ_PROVIDER, "minimax")
+
+    @patch("server.subprocess.run")
+    def test_read_only_flag_also_selects_read_override(self, mock_run):
+        """read_only=True (the actual /run request shape, not a raw
+        force_mode kwarg) must resolve through the same path."""
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", force_mode="READ", caller_scope=None)
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_READ_MODEL)
+
+    @patch("server.subprocess.run")
+    def test_customer_scope_unaffected_by_read_override(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", force_mode="CUSTOMER", caller_scope="customer",
+        )
+        cmd = mock_run.call_args[0][0]
+        if server.HERMES_RUNNER_MODEL:
+            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
+        if server.HERMES_RUNNER_MODEL != server.HERMES_RUNNER_READ_MODEL:
+            self.assertNotIn(server.HERMES_RUNNER_READ_MODEL, cmd)
+
+    @patch("server.subprocess.run")
+    def test_build_run_modes_unaffected_by_read_override(self, mock_run):
+        """BUILD/RUN must keep selecting HERMES_RUNNER_BUILD_MODEL, not
+        accidentally fall onto the new READ override."""
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", force_mode="BUILD")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_BUILD_MODEL)
+
+    @patch("server.subprocess.run")
+    def test_whatsapp_admin_override_takes_precedence_over_read_override(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", force_mode="READ",
             readonly_key="readonly:whatsapp_relay",
         )
         cmd = mock_run.call_args[0][0]
