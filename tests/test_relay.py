@@ -213,6 +213,85 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
         self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
 
 
+class TestRunHermesBuildModeOverride(unittest.TestCase):
+    """2026-08-20: BUILD/RUN mode conversations (elevated agentic coding
+    work — where authorize_build/authorize_action actually get called) must
+    select HERMES_RUNNER_BUILD_MODEL/PROVIDER instead of
+    HERMES_RUNNER_MODEL/PROVIDER's default, mirroring the WhatsApp Admin
+    override immediately above. READ and CUSTOMER mode must stay
+    completely unaffected — the whole point is a narrow, mode-scoped
+    override, not a blast-radius-widening change to the general default."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.mode_file = os.path.join(self.tmp_dir, "current_mode.txt")
+        self._mode_patch = patch.object(server, "MODE_FILE", self.mode_file)
+        self._mode_patch.start()
+
+    def tearDown(self):
+        self._mode_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _fake_result(self, stdout="reply text", stderr="session_id: abc123", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @patch("server.subprocess.run")
+    def test_build_mode_selects_build_override(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", force_mode="BUILD")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_BUILD_MODEL)
+        self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_BUILD_PROVIDER)
+        self.assertEqual(server.HERMES_RUNNER_BUILD_MODEL, "MiniMax-M3")
+        self.assertEqual(server.HERMES_RUNNER_BUILD_PROVIDER, "minimax")
+
+    @patch("server.subprocess.run")
+    def test_run_mode_selects_build_override(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", force_mode="RUN")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_BUILD_MODEL)
+        self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_BUILD_PROVIDER)
+
+    @patch("server.subprocess.run")
+    def test_read_mode_keeps_default_model_not_build_override(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", force_mode="READ")
+        cmd = mock_run.call_args[0][0]
+        if server.HERMES_RUNNER_MODEL:
+            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
+        if server.HERMES_RUNNER_MODEL != server.HERMES_RUNNER_BUILD_MODEL:
+            self.assertNotIn(server.HERMES_RUNNER_BUILD_MODEL, cmd)
+
+    @patch("server.subprocess.run")
+    def test_customer_scope_unaffected_by_build_override(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", force_mode="CUSTOMER", caller_scope="customer",
+        )
+        cmd = mock_run.call_args[0][0]
+        if server.HERMES_RUNNER_MODEL:
+            self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
+
+    @patch("server.subprocess.run")
+    def test_whatsapp_admin_override_takes_precedence_over_build_override(self, mock_run):
+        """readonly_key="readonly:whatsapp_relay" always pairs with
+        force_mode="READ" in practice (do_POST's own rule), so this is a
+        belt-and-suspenders check that the two conditions never fight even
+        if force_mode were somehow BUILD/RUN alongside that readonly_key."""
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", force_mode="BUILD",
+            readonly_key="readonly:whatsapp_relay",
+        )
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL)
+
+
 class TestParseRunRequest(unittest.TestCase):
     """Unit tests against the real request-validation function do_POST
     calls — not a reimplementation of its logic."""
@@ -262,7 +341,7 @@ class TestParseRunRequest(unittest.TestCase):
 
     def test_read_only_without_session_id_forces_read_mode(self):
         body = {"read_only": True, "message": "hi"}
-        session_id, message, persona, force_mode, readonly_key, err = server._parse_run_request(body)
+        session_id, message, persona, force_mode, readonly_key, caller_scope, err = server._parse_run_request(body)
         self.assertIsNone(err)
         self.assertIsNone(session_id)
         self.assertEqual(force_mode, "READ")
@@ -270,19 +349,19 @@ class TestParseRunRequest(unittest.TestCase):
 
     def test_normal_request_no_force_mode(self):
         body = {"message": "hi", "hermes_session_id": "abc123"}
-        session_id, message, persona, force_mode, readonly_key, err = server._parse_run_request(body)
+        session_id, message, persona, force_mode, readonly_key, caller_scope, err = server._parse_run_request(body)
         self.assertIsNone(err)
         self.assertEqual(session_id, "abc123")
         self.assertIsNone(force_mode)
 
     def test_empty_message_rejected(self):
         body = {"message": "   "}
-        _, _, _, _, _, err = server._parse_run_request(body)
+        _, _, _, _, _, _, err = server._parse_run_request(body)
         self.assertEqual(err, "message required")
 
     def test_invalid_persona_falls_back_to_default(self):
         body = {"message": "hi", "persona": "not-a-real-persona"}
-        _, _, persona, _, _, err = server._parse_run_request(body)
+        _, _, persona, _, _, _, err = server._parse_run_request(body)
         self.assertIsNone(err)
         self.assertEqual(persona, server.DEFAULT_PERSONA)
 
@@ -290,7 +369,7 @@ class TestParseRunRequest(unittest.TestCase):
 
     def test_readonly_key_parsed_when_read_only(self):
         body = {"read_only": True, "message": "hi", "readonly_key": "readonly:whatsapp_relay"}
-        _, _, _, force_mode, readonly_key, err = server._parse_run_request(body)
+        _, _, _, force_mode, readonly_key, caller_scope, err = server._parse_run_request(body)
         self.assertIsNone(err)
         self.assertEqual(force_mode, "READ")
         self.assertEqual(readonly_key, "readonly:whatsapp_relay")
@@ -301,14 +380,14 @@ class TestParseRunRequest(unittest.TestCase):
         parsing doesn't error; the "ignored" half is covered by
         TestRunEndpointLocking below."""
         body = {"message": "hi", "readonly_key": "readonly:whatsapp_relay"}
-        _, _, _, force_mode, readonly_key, err = server._parse_run_request(body)
+        _, _, _, force_mode, readonly_key, caller_scope, err = server._parse_run_request(body)
         self.assertIsNone(err)
         self.assertIsNone(force_mode)
         self.assertEqual(readonly_key, "readonly:whatsapp_relay")
 
     def test_missing_readonly_key_defaults_to_none(self):
         body = {"read_only": True, "message": "hi"}
-        _, _, _, _, readonly_key, _ = server._parse_run_request(body)
+        _, _, _, _, readonly_key, _, _ = server._parse_run_request(body)
         self.assertIsNone(readonly_key)
 
 
@@ -358,6 +437,87 @@ class TestLockKeyFor(unittest.TestCase):
         lock_a = server._lock_for(key_a)
         lock_b = server._lock_for(key_b)
         self.assertIs(lock_a, lock_b)
+
+
+class TestSchemaProbeFailureHaltObservability(unittest.TestCase):
+    """2026-08-16: the deferred-call validation gap this hard-stop guards
+    against is closed and tested in hermes-agent (ae4551f2c); the
+    underlying model habit that trips it (repeatedly observed against
+    opencode_dispatch specifically) is not fixed. hermes-agent's own
+    run_agent.py logs a structured "[schema_probe_failure_halt]
+    tool=... count=..." warning via stdlib logging, which reaches this
+    subprocess's stderr -- this reuses the existing subprocess_diag.log
+    (_append_diag) sink to make that durably queryable, no new log file."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.diag_file = os.path.join(self.tmp_dir, "subprocess_diag.log")
+        self._diag_patch = patch.object(server, "DIAG_LOG_FILE", self.diag_file)
+        self._diag_patch.start()
+
+    def tearDown(self):
+        self._diag_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _read_diag_events(self):
+        if not os.path.exists(self.diag_file):
+            return []
+        with open(self.diag_file) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_marker_in_stderr_recorded_as_diag_event(self):
+        server._record_schema_probe_halts(
+            "some other log line\n"
+            "[schema_probe_failure_halt] tool=opencode_dispatch count=3\n",
+            "sess-1",
+        )
+        events = [e for e in self._read_diag_events() if e["event"] == "schema_probe_failure_halt"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["tool"], "opencode_dispatch")
+        self.assertEqual(events[0]["count"], 3)
+        self.assertEqual(events[0]["session"], "sess-1")
+
+    def test_no_marker_records_nothing(self):
+        server._record_schema_probe_halts("a normal successful run, no halts here\n", "sess-2")
+        events = [e for e in self._read_diag_events() if e["event"] == "schema_probe_failure_halt"]
+        self.assertEqual(events, [])
+
+    def test_no_session_id_uses_new(self):
+        server._record_schema_probe_halts(
+            "[schema_probe_failure_halt] tool=send_whatsapp_message count=3\n", None,
+        )
+        events = [e for e in self._read_diag_events() if e["event"] == "schema_probe_failure_halt"]
+        self.assertEqual(events[0]["session"], "new")
+
+    def test_multiple_markers_in_one_run_all_recorded(self):
+        """A single turn can trip more than one tool's halt (e.g. the model
+        retries a different tool after the first hard-stop) -- every
+        occurrence must be captured, not just the first."""
+        server._record_schema_probe_halts(
+            "[schema_probe_failure_halt] tool=opencode_dispatch count=3\n"
+            "[schema_probe_failure_halt] tool=send_whatsapp_message count=3\n",
+            "sess-3",
+        )
+        events = [e for e in self._read_diag_events() if e["event"] == "schema_probe_failure_halt"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual({e["tool"] for e in events}, {"opencode_dispatch", "send_whatsapp_message"})
+
+    @patch("server.subprocess.run")
+    def test_run_hermes_wires_stderr_scan_automatically(self, mock_run):
+        """Regression guard: confirms _run_subprocess_once (called by
+        run_hermes) actually scans real subprocess stderr, not just that
+        _record_schema_probe_halts works in isolation above."""
+        result = MagicMock()
+        result.stdout = "some reply"
+        result.stderr = "session_id: abc123\n[schema_probe_failure_halt] tool=opencode_dispatch count=3\n"
+        result.returncode = 0
+        mock_run.return_value = result
+
+        server.run_hermes(None, "hello", "helpful")
+
+        events = [e for e in self._read_diag_events() if e["event"] == "schema_probe_failure_halt"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["tool"], "opencode_dispatch")
 
 
 if __name__ == "__main__":

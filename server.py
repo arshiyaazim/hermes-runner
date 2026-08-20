@@ -170,6 +170,27 @@ HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER = os.environ.get(
     "HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER", "minimax"
 )
 
+# ── BUILD/RUN mode model override (2026-08-20, Owner-directed) ─────────────
+# Same reasoning and mechanism as the WhatsApp Admin relay override directly
+# above: HERMES_RUNNER_MODEL/PROVIDER are process-wide, too broad a blast
+# radius for a change that should only touch elevated agentic coding work.
+# Live testing this session (task_action_policy / hermes_tasks NL-authorization
+# pass) reproduced the exact same known gemini-3.1-flash-lite deferred-
+# tool-call defect (project_hermes_toolcall_reason_bug_audit_20260811) against
+# the new authorize_action/authorize_build MCP tools: the model repeatedly sent
+# {"reason": "..."} instead of the real schema, in two independent live turns,
+# both hanging to the full 300s timeout with zero successful call. mode is a
+# clean, pre-existing boundary here -- BUILD/RUN are only ever reached via an
+# authenticated interactive/relay caller doing real task/code work (never
+# caller_scope="customer", which hard-locks to the separate "CUSTOMER" mode
+# value and never overlaps), so scoping the override to
+# `mode in ("BUILD", "RUN")` cannot leak into customer-facing traffic.
+# Checked after the WhatsApp-admin-readonly override above since that path is
+# always force_mode="READ" (never BUILD/RUN) -- the two conditions are
+# mutually exclusive by construction, not by priority ordering.
+HERMES_RUNNER_BUILD_MODEL = os.environ.get("HERMES_RUNNER_BUILD_MODEL", "MiniMax-M3")
+HERMES_RUNNER_BUILD_PROVIDER = os.environ.get("HERMES_RUNNER_BUILD_PROVIDER", "minimax")
+
 # ── Timeout chain (2026-08-06, corrected after a real incident; widened
 # 2026-08-14 for opencode_dispatch headroom -- see P2 handoff) ─────────────
 # Every hop between the browser and this process has its own timeout, and
@@ -1038,6 +1059,8 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
     ]
     if readonly_key == WHATSAPP_ADMIN_READONLY_KEY:
         model, provider = HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER
+    elif mode in ("BUILD", "RUN"):
+        model, provider = HERMES_RUNNER_BUILD_MODEL, HERMES_RUNNER_BUILD_PROVIDER
     else:
         model, provider = HERMES_RUNNER_MODEL, HERMES_RUNNER_PROVIDER
     if model:
