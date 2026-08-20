@@ -1017,10 +1017,16 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
     the interactive web UI -- see fazle-core's
     modules.admin_directives.router._call_hermes_readonly's own docstring
     for the full rationale and the gates that still apply upstream of this
-    function (RBAC superadmin, exact admin phone, dedicated channel, and
-    mode itself still only ever elevated via the existing `/api/hermes/
-    mode` web endpoint -- nothing reachable from WhatsApp can elevate mode
-    itself).
+    function (RBAC superadmin, exact admin phone, dedicated channel).
+    current_mode.txt (the persisted global mode the web UI's dropdown
+    writes to) is still only ever elevated via the existing `/api/hermes/
+    mode` web endpoint -- nothing reachable from WhatsApp writes that file.
+    UPDATED 2026-08-20 (Owner-directed): the WhatsApp Admin relay's
+    *toolset* (not the persisted mode value) is separately guaranteed RUN
+    regardless of current_mode.txt -- see the readonly_key paragraph below
+    for why this is safe (the real enforcement moved to the
+    task_action_policy CLI plugin this same pass, so toolset access no
+    longer needs to double as the authorization boundary).
 
     caller_scope (Phase 1, 2026-08-12): "customer" swaps SYSTEM_PREAMBLE
     for CUSTOMER_SYSTEM_PREAMBLE and skips NEW_CONVERSATION_GREETING and
@@ -1028,17 +1034,34 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
     auth/validation that guarantees caller_scope="customer" only ever
     arrives paired with force_mode="CUSTOMER".
 
-    readonly_key (2026-08-12, WhatsApp Admin relay model override): used
-    ONLY to select which model/provider override applies (see
-    WHATSAPP_ADMIN_READONLY_KEY below) -- does not affect toolsets,
-    preamble, or locking (that's still readonly_key's original,
-    unmodified purpose in do_POST/_lock_key_for). A value other than
-    exactly "readonly:whatsapp_relay" (including None, and including
-    every other caller's own readonly_key such as Phase 5B's
-    "readonly:job:<name>") falls through to HERMES_RUNNER_MODEL/PROVIDER,
-    unchanged from today's behavior."""
+    readonly_key (2026-08-12, WhatsApp Admin relay model override; 2026-08-20,
+    now also a toolset override): originally selected ONLY the model/provider
+    override (see WHATSAPP_ADMIN_READONLY_KEY below). Extended 2026-08-20
+    (Owner-directed, "WhatsApp must not depend on a website dropdown") to also
+    guarantee the RUN toolset (file/code_execution/terminal tools available)
+    for this exact relay, regardless of whatever mode is currently persisted
+    in current_mode.txt for the interactive web UI -- current_mode.txt itself
+    is NOT written here, the dropdown still works exactly as before for
+    manual admin use, and this is not "unrestricted global RUN mode": every
+    actual mutation (file write, git commit, service restart, migration,
+    deploy) still goes through the real enforcement layer -- the CLI's
+    task_action_policy pre_tool_call plugin, which requires a live task-scoped
+    authorize_build grant (for edits) or a diff/category-matched
+    authorize_action approval (for commits/deploys/restarts) no matter which
+    toolset exposed the tool. Giving this one relay guaranteed tool access
+    only lets Earth *attempt* those calls -- the plugin decides whether they
+    execute. `mode` itself (used below for locking/session-registration/the
+    reported API field) is left untouched, matching the pre-existing
+    precedent that the model override above is likewise never reflected in
+    the reported `mode` field. A readonly_key other than exactly
+    "readonly:whatsapp_relay" (including None, and every other caller's own
+    key such as Phase 5B's "readonly:job:<name>") is completely unaffected --
+    falls through to read_current_mode()'s toolset exactly as before."""
     mode = force_mode if force_mode in MODE_TOOLSETS else read_current_mode()
-    toolsets = MODE_TOOLSETS[mode]
+    if readonly_key == WHATSAPP_ADMIN_READONLY_KEY:
+        toolsets = MODE_TOOLSETS["RUN"]
+    else:
+        toolsets = MODE_TOOLSETS[mode]
     if caller_scope == "customer":
         preamble = CUSTOMER_SYSTEM_PREAMBLE
     else:

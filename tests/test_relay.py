@@ -213,6 +213,80 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
         self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
 
 
+class TestRunHermesWhatsAppAdminToolsetOverride(unittest.TestCase):
+    """2026-08-20 (Owner-directed): the WhatsApp Admin relay's readonly_key
+    must guarantee the RUN toolset (file/code_execution/terminal available)
+    regardless of whatever mode is currently persisted -- WhatsApp must not
+    depend on the Owner visiting the website to flip a dropdown. This does
+    NOT touch current_mode.txt itself (the web UI's own dropdown is
+    unaffected) and every other caller (no readonly_key, or a different one)
+    must see no change at all."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.mode_file = os.path.join(self.tmp_dir, "current_mode.txt")
+        self._mode_patch = patch.object(server, "MODE_FILE", self.mode_file)
+        self._mode_patch.start()
+
+    def tearDown(self):
+        self._mode_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _fake_result(self, stdout="reply text", stderr="session_id: abc123", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @patch("server.subprocess.run")
+    def test_whatsapp_relay_gets_run_toolset_even_when_mode_file_says_read(self, mock_run):
+        with open(self.mode_file, "w") as f:
+            json.dump({"mode": "READ", "set_at": None, "expires_at": None, "scope": None, "set_by": None}, f)
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "fix the bug", "devoted", readonly_key="readonly:whatsapp_relay",
+        )
+        cmd = mock_run.call_args[0][0]
+        toolsets_idx = cmd.index("-t") + 1
+        self.assertEqual(cmd[toolsets_idx], server.MODE_TOOLSETS["RUN"])
+
+    @patch("server.subprocess.run")
+    def test_whatsapp_relay_toolset_override_does_not_touch_mode_file(self, mock_run):
+        with open(self.mode_file, "w") as f:
+            json.dump({"mode": "READ", "set_at": None, "expires_at": None, "scope": None, "set_by": None}, f)
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "fix the bug", "devoted", readonly_key="readonly:whatsapp_relay",
+        )
+        with open(self.mode_file) as f:
+            self.assertEqual(json.load(f)["mode"], "READ")  # untouched -- web UI dropdown unaffected
+
+    @patch("server.subprocess.run")
+    def test_different_readonly_key_keeps_persisted_toolset(self, mock_run):
+        """Phase 5B alert-investigation jobs (readonly:job:<name>) must NOT
+        be swept into the WhatsApp-relay-only toolset override."""
+        with open(self.mode_file, "w") as f:
+            json.dump({"mode": "READ", "set_at": None, "expires_at": None, "scope": None, "set_by": None}, f)
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", readonly_key="readonly:job:bridge_watchdog",
+        )
+        cmd = mock_run.call_args[0][0]
+        toolsets_idx = cmd.index("-t") + 1
+        self.assertEqual(cmd[toolsets_idx], server.MODE_TOOLSETS["READ"])
+
+    @patch("server.subprocess.run")
+    def test_no_readonly_key_keeps_persisted_toolset(self, mock_run):
+        with open(self.mode_file, "w") as f:
+            json.dump({"mode": "BUILD", "set_at": None, "expires_at": None, "scope": None, "set_by": None}, f)
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful")
+        cmd = mock_run.call_args[0][0]
+        toolsets_idx = cmd.index("-t") + 1
+        self.assertEqual(cmd[toolsets_idx], server.MODE_TOOLSETS["BUILD"])
+
+
 class TestRunHermesBuildModeOverride(unittest.TestCase):
     """2026-08-20: BUILD/RUN mode conversations (elevated agentic coding
     work — where authorize_build/authorize_action actually get called) must
