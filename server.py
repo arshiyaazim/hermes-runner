@@ -527,10 +527,22 @@ def read_current_mode():
     return read_mode_state()["mode"]
 
 
-def write_mode_state(mode, ttl_seconds=None, scope=None, set_by="admin"):
+def write_mode_state(mode, ttl_seconds=None, scope=None, set_by="admin", permanent=False):
     """Validates and persists a new mode, optionally with a TTL. Raises
     ValueError on any invalid input — callers must not let an invalid
-    request silently fall through to a permanent BUILD/RUN grant."""
+    request silently fall through to a permanent BUILD/RUN grant.
+
+    permanent (2026-08-25, explicit Owner decision, reverses the
+    2026-08-10 "no TTL must not silently mean forever" hardening for
+    BUILD/RUN specifically): when True and mode != DEFAULT_MODE, sets
+    expires_at=None deliberately -- distinct from the old bug this
+    parameter reopens, because it can ONLY happen via an explicit,
+    audited `permanent: true` in the request body, never as a silent
+    fallback from an omitted ttl_seconds (that still hits
+    DEFAULT_TTL_SECONDS_WHEN_UNSPECIFIED exactly as before). Every call
+    with permanent=True is logged as its own distinct audit event
+    (see _append_audit_log below) so a permanent elevation is always
+    traceable to who requested it and when."""
     mode = (mode or "").strip().upper()
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
@@ -538,6 +550,20 @@ def write_mode_state(mode, ttl_seconds=None, scope=None, set_by="admin"):
     scope = (scope or "").strip().upper() or None
     if scope is not None and scope not in SCOPES:
         raise ValueError(f"scope must be one of {SCOPES}")
+
+    if permanent and mode != DEFAULT_MODE:
+        now = _now()
+        state = {"mode": mode, "set_at": now.isoformat(), "expires_at": None, "scope": None, "set_by": set_by}
+        with _mode_lock:
+            old_state, _ = _read_state_unlocked()
+            _write_state_unlocked(state)
+        _append_audit_log({
+            "at": now.isoformat(), "event": "mode_change_permanent",
+            "from_mode": old_state.get("mode"), "to_mode": mode,
+            "ttl_seconds": None, "scope": None, "set_by": set_by,
+            "note": "explicit permanent grant, no auto-expiry — 2026-08-25 Owner decision",
+        })
+        return {**state, "expired": False, "seconds_remaining": None}
 
     if ttl_seconds is not None:
         try:
@@ -1313,6 +1339,7 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("mode"),
                     ttl_seconds=body.get("ttl_seconds"),
                     scope=body.get("scope"),
+                    permanent=bool(body.get("permanent")),
                 )
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
