@@ -163,6 +163,15 @@ HERMES_RUNNER_PROVIDER = os.environ.get("HERMES_RUNNER_PROVIDER", "")
 # above -- but the whole point of this block is the WhatsApp relay no
 # longer using gemini-3.1-flash-lite, so it defaults ON to MiniMax-M3.
 WHATSAPP_ADMIN_READONLY_KEY = "readonly:whatsapp_relay"
+# 2026-08-25, WS6 acceptance-test finding: this server process's own cwd
+# (/home/azim/hermes-runner) was being inherited by every `hermes chat`
+# subprocess, including real Owner coding requests over this exact
+# channel -- Hermes had no visibility into fazle-core at all. Scoped
+# only to this readonly_key (see _run_hermes_once's cwd param and its
+# call site below); every other caller/mode is unaffected.
+HERMES_RUNNER_WHATSAPP_ADMIN_REPO_PATH = os.environ.get(
+    "HERMES_RUNNER_WHATSAPP_ADMIN_REPO_PATH", os.path.expanduser("~/core")
+)
 HERMES_RUNNER_WHATSAPP_ADMIN_MODEL = os.environ.get(
     "HERMES_RUNNER_WHATSAPP_ADMIN_MODEL", "MiniMax-M3"
 )
@@ -961,11 +970,23 @@ def _log(msg: str) -> None:
     sys.stderr.write(f"[hermes-runner] {ts} {msg}\n")
 
 
-def _run_hermes_once(cmd, env, timeout_seconds, session_id=None, persona=None):
+def _run_hermes_once(cmd, env, timeout_seconds, session_id=None, persona=None, cwd=None):
     """The one subprocess.run() attempt at the `hermes chat` CLI, with
     before/after diagnostic logging (2026-08-06) so a hang shows its actual
     timing instead of pure silence until the caller's own timeout error.
     Returns (CompletedProcess | None, timed_out, crash_detail | None).
+
+    cwd (2026-08-25, WS6 acceptance-test finding): subprocess.run() never
+    received a cwd, so the child inherited this SERVER PROCESS's own
+    working directory (/home/azim/hermes-runner) instead of the target
+    repository -- every real Owner->Hermes coding request via the
+    WhatsApp relay silently ran with no visibility into fazle-core at
+    all. Confirmed live: a real Owner request to edit
+    resources/ops/recruitment_source_of_truth.txt got "I can't find that
+    file anywhere in this repository" -- Hermes was telling the truth,
+    it just wasn't looking in fazle-core. None preserves every other
+    caller's exact prior behavior byte-for-byte; only run_hermes()'s
+    WHATSAPP_ADMIN_READONLY_KEY branch passes a real path.
 
     crash_detail (2026-08-13): previously, anything subprocess.run() itself
     could raise OUTSIDE TimeoutExpired (e.g. OSError starting the child)
@@ -1004,6 +1025,7 @@ def _run_hermes_once(cmd, env, timeout_seconds, session_id=None, persona=None):
             text=True,
             timeout=timeout_seconds,
             env=env,
+            cwd=cwd,
         )
     except subprocess.TimeoutExpired as e:
         elapsed = time.monotonic() - started
@@ -1170,8 +1192,18 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
     # See STALE_CALL_TIMEOUT_SECONDS' definition above for why this is set.
     env = {**os.environ, "HERMES_API_CALL_STALE_TIMEOUT": STALE_CALL_TIMEOUT_SECONDS}
 
+    # 2026-08-25, WS6 acceptance-test finding: only the WhatsApp Owner
+    # relay gets a real repo cwd -- every other caller/mode keeps cwd=None
+    # (subprocess.run()'s own default: inherit this server's cwd), exactly
+    # byte-identical to behavior before this fix.
+    cwd = (
+        HERMES_RUNNER_WHATSAPP_ADMIN_REPO_PATH
+        if readonly_key == WHATSAPP_ADMIN_READONLY_KEY
+        else None
+    )
+
     result, timed_out, crash_detail = _run_hermes_once(
-        cmd, env, TIMEOUT_SECONDS, session_id=hermes_session_id, persona=persona
+        cmd, env, TIMEOUT_SECONDS, session_id=hermes_session_id, persona=persona, cwd=cwd
     )
     if timed_out:
         return None, None, "Earth did not respond in time", mode

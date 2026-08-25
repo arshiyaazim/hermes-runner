@@ -293,6 +293,69 @@ class TestRunHermesWhatsAppAdminToolsetOverride(unittest.TestCase):
         self.assertEqual(cmd[toolsets_idx], server.MODE_TOOLSETS["BUILD"])
 
 
+class TestRunHermesWorkingDirectory(unittest.TestCase):
+    """2026-08-25, WS6 acceptance-test finding: subprocess.run() was never
+    given a cwd, so every `hermes chat` child inherited this server
+    process's own working directory (/home/azim/hermes-runner) instead of
+    the target repository -- confirmed live via a real Owner WhatsApp
+    request to edit a fazle-core file, which Hermes correctly reported it
+    could not find (it was looking in the wrong repo entirely). Fix is
+    scoped to the WhatsApp-relay readonly_key only; every other caller/mode
+    must keep cwd=None (subprocess.run()'s own inherit-parent-cwd
+    default), byte-identical to pre-fix behavior."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.mode_file = os.path.join(self.tmp_dir, "current_mode.txt")
+        self._mode_patch = patch.object(server, "MODE_FILE", self.mode_file)
+        self._mode_patch.start()
+
+    def tearDown(self):
+        self._mode_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _fake_result(self, stdout="reply text", stderr="session_id: abc123", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @patch("server.subprocess.run")
+    def test_whatsapp_relay_gets_real_repo_cwd(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "fix the bug", "devoted", readonly_key="readonly:whatsapp_relay",
+        )
+        self.assertEqual(
+            mock_run.call_args.kwargs.get("cwd"),
+            server.HERMES_RUNNER_WHATSAPP_ADMIN_REPO_PATH,
+        )
+        self.assertTrue(mock_run.call_args.kwargs.get("cwd"))  # never empty/None
+
+    @patch("server.subprocess.run")
+    def test_job_readonly_key_keeps_default_cwd(self, mock_run):
+        """Phase 5B alert-investigation jobs must NOT inherit the
+        WhatsApp-relay-only repo cwd override."""
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(
+            None, "hello", "helpful", readonly_key="readonly:job:bridge_watchdog",
+        )
+        self.assertIsNone(mock_run.call_args.kwargs.get("cwd"))
+
+    @patch("server.subprocess.run")
+    def test_no_readonly_key_keeps_default_cwd(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful")
+        self.assertIsNone(mock_run.call_args.kwargs.get("cwd"))
+
+    @patch("server.subprocess.run")
+    def test_customer_scope_keeps_default_cwd(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "hello", "helpful", caller_scope="customer")
+        self.assertIsNone(mock_run.call_args.kwargs.get("cwd"))
+
+
 class TestRunHermesBuildModeOverride(unittest.TestCase):
     """2026-08-20: BUILD/RUN mode conversations (elevated agentic coding
     work — where authorize_build/authorize_action actually get called) must
