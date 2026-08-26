@@ -173,10 +173,10 @@ HERMES_RUNNER_WHATSAPP_ADMIN_REPO_PATH = os.environ.get(
     "HERMES_RUNNER_WHATSAPP_ADMIN_REPO_PATH", os.path.expanduser("~/core")
 )
 HERMES_RUNNER_WHATSAPP_ADMIN_MODEL = os.environ.get(
-    "HERMES_RUNNER_WHATSAPP_ADMIN_MODEL", "MiniMax-M3"
+    "HERMES_RUNNER_WHATSAPP_ADMIN_MODEL", "claude/claude-opus-4-6"
 )
 HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER = os.environ.get(
-    "HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER", "minimax"
+    "HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER", "omniroute"
 )
 
 # ── BUILD/RUN mode model override (2026-08-20, Owner-directed) ─────────────
@@ -197,8 +197,8 @@ HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER = os.environ.get(
 # Checked after the WhatsApp-admin-readonly override above since that path is
 # always force_mode="READ" (never BUILD/RUN) -- the two conditions are
 # mutually exclusive by construction, not by priority ordering.
-HERMES_RUNNER_BUILD_MODEL = os.environ.get("HERMES_RUNNER_BUILD_MODEL", "MiniMax-M3")
-HERMES_RUNNER_BUILD_PROVIDER = os.environ.get("HERMES_RUNNER_BUILD_PROVIDER", "minimax")
+HERMES_RUNNER_BUILD_MODEL = os.environ.get("HERMES_RUNNER_BUILD_MODEL", "claude/claude-opus-4-6")
+HERMES_RUNNER_BUILD_PROVIDER = os.environ.get("HERMES_RUNNER_BUILD_PROVIDER", "omniroute")
 
 # ── READ mode model override (2026-08-21, Owner-directed) ──────────────────
 # Same reasoning and mechanism as the BUILD/RUN override directly above.
@@ -217,8 +217,8 @@ HERMES_RUNNER_BUILD_PROVIDER = os.environ.get("HERMES_RUNNER_BUILD_PROVIDER", "m
 # fazle-core tool access (see MODE_TOOLSETS["CUSTOMER"]'s own comment), so
 # this defect class cannot occur there regardless of model, and widening
 # scope beyond what's actually affected isn't warranted.
-HERMES_RUNNER_READ_MODEL = os.environ.get("HERMES_RUNNER_READ_MODEL", "MiniMax-M3")
-HERMES_RUNNER_READ_PROVIDER = os.environ.get("HERMES_RUNNER_READ_PROVIDER", "minimax")
+HERMES_RUNNER_READ_MODEL = os.environ.get("HERMES_RUNNER_READ_MODEL", "claude/claude-opus-4-6")
+HERMES_RUNNER_READ_PROVIDER = os.environ.get("HERMES_RUNNER_READ_PROVIDER", "omniroute")
 
 # ── Timeout chain (2026-08-06, corrected after a real incident; widened
 # 2026-08-14 for opencode_dispatch headroom -- see P2 handoff) ─────────────

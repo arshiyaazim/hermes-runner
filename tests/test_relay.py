@@ -173,8 +173,8 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL)
         self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER)
-        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, "MiniMax-M3")
-        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER, "minimax")
+        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, "claude/claude-opus-4-6")
+        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER, "omniroute")
 
     @patch("server.subprocess.run")
     def test_no_readonly_key_selects_read_override_not_whatsapp_override(self, mock_run):
@@ -389,8 +389,8 @@ class TestRunHermesBuildModeOverride(unittest.TestCase):
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_BUILD_MODEL)
         self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_BUILD_PROVIDER)
-        self.assertEqual(server.HERMES_RUNNER_BUILD_MODEL, "MiniMax-M3")
-        self.assertEqual(server.HERMES_RUNNER_BUILD_PROVIDER, "minimax")
+        self.assertEqual(server.HERMES_RUNNER_BUILD_MODEL, "claude/claude-opus-4-6")
+        self.assertEqual(server.HERMES_RUNNER_BUILD_PROVIDER, "omniroute")
 
     @patch("server.subprocess.run")
     def test_run_mode_selects_build_override(self, mock_run):
@@ -477,8 +477,8 @@ class TestRunHermesReadModeOverride(unittest.TestCase):
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_READ_MODEL)
         self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_READ_PROVIDER)
-        self.assertEqual(server.HERMES_RUNNER_READ_MODEL, "MiniMax-M3")
-        self.assertEqual(server.HERMES_RUNNER_READ_PROVIDER, "minimax")
+        self.assertEqual(server.HERMES_RUNNER_READ_MODEL, "claude/claude-opus-4-6")
+        self.assertEqual(server.HERMES_RUNNER_READ_PROVIDER, "omniroute")
 
     @patch("server.subprocess.run")
     def test_read_only_flag_also_selects_read_override(self, mock_run):
