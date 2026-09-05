@@ -164,7 +164,14 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
         return result
 
     @patch("server.subprocess.run")
-    def test_whatsapp_relay_readonly_key_selects_minimax(self, mock_run):
+    def test_whatsapp_relay_readonly_key_selects_the_configured_admin_override(self, mock_run):
+        """Renamed 2026-09-05 (was test_..._selects_minimax -- stale name
+        left over from an earlier code-default change; MiniMax was never
+        what this test's own assertions checked). This test only proves
+        the readonly_key->override WIRING, not any specific vendor -- see
+        TestWhatsAppAdminModelSelection below for the Owner's 2026-09-05
+        MiniMax-cancelled / deepseek-via-openrouter final decision, tested
+        against the actual deployed values."""
         mock_run.return_value = self._fake_result()
         server.run_hermes(
             None, "hello", "helpful", force_mode="READ",
@@ -173,8 +180,6 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL)
         self.assertEqual(cmd[cmd.index("--provider") + 1], server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER)
-        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, "claude/claude-opus-4-6")
-        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER, "omniroute")
 
     @patch("server.subprocess.run")
     def test_no_readonly_key_selects_read_override_not_whatsapp_override(self, mock_run):
@@ -217,6 +222,113 @@ class TestRunHermesWhatsAppAdminModelOverride(unittest.TestCase):
         if server.HERMES_RUNNER_MODEL:
             self.assertEqual(cmd[cmd.index("-m") + 1], server.HERMES_RUNNER_MODEL)
         self.assertNotIn(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, cmd)
+
+
+class TestWhatsAppAdminFinalModelDecision(unittest.TestCase):
+    """Owner final decision (2026-09-05): MiniMax-M3 cancelled (credit
+    exhausted) for the fazle-core WhatsApp Admin route
+    (Bridge1/Bridge2 -> fazle-core -> hermes-runner:8093). Target:
+    provider=openrouter, model=deepseek/deepseek-v4-pro-0813, mode=RUN.
+    Deployed to hermes-runner/.env this session (not committed -- .env is
+    gitignored); these tests patch the already-imported module-level
+    constants directly to the deployed target values rather than reload
+    the module or depend on a real .env being sourced by the test runner
+    (which correctly never happens), exercising the exact same
+    readonly_key-driven code path the live deployed config uses."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.mode_file = os.path.join(self.tmp_dir, "current_mode.txt")
+        self._mode_patch = patch.object(server, "MODE_FILE", self.mode_file)
+        self._mode_patch.start()
+        self._model_patch = patch.object(server, "HERMES_RUNNER_WHATSAPP_ADMIN_MODEL", "deepseek/deepseek-v4-pro-0813")
+        self._provider_patch = patch.object(server, "HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER", "openrouter")
+        self._model_patch.start()
+        self._provider_patch.start()
+
+    def tearDown(self):
+        self._provider_patch.stop()
+        self._model_patch.stop()
+        self._mode_patch.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _fake_result(self, stdout="reply text", stderr="session_id: abc123", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @patch("server.subprocess.run")
+    def test_1_admin_request_selects_openrouter(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "check bridge health", "helpful", force_mode="READ",
+                           readonly_key="readonly:whatsapp_relay")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("--provider") + 1], "openrouter")
+
+    def test_2_model_is_exactly_deepseek_v4_pro_0813(self):
+        self.assertEqual(server.HERMES_RUNNER_WHATSAPP_ADMIN_MODEL, "deepseek/deepseek-v4-pro-0813")
+
+    @patch("server.subprocess.run")
+    def test_3_run_mode_toolset_forced_regardless_of_persisted_mode(self, mock_run):
+        with open(self.mode_file, "w") as f:
+            json.dump({"mode": "READ", "set_at": None, "expires_at": None, "scope": None, "set_by": None}, f)
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "check bridge health", "helpful",
+                           readonly_key="readonly:whatsapp_relay")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-t") + 1], server.MODE_TOOLSETS["RUN"])
+
+    @patch("server.subprocess.run")
+    def test_4_minimax_is_not_selected(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "check bridge health", "helpful", force_mode="READ",
+                           readonly_key="readonly:whatsapp_relay")
+        cmd = mock_run.call_args[0][0]
+        self.assertNotIn("minimax", [c.lower() for c in cmd])
+        self.assertNotIn("MiniMax-M3", cmd)
+
+    @patch("server.subprocess.run")
+    def test_5_omniroute_is_not_selected(self, mock_run):
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "check bridge health", "helpful", force_mode="READ",
+                           readonly_key="readonly:whatsapp_relay")
+        cmd = mock_run.call_args[0][0]
+        self.assertNotIn("omniroute", [c.lower() for c in cmd])
+
+    @patch("server.subprocess.run")
+    def test_6_missing_model_and_provider_omits_flags_rather_than_crash(self, mock_run):
+        """'leave unset/empty to fall back to Hermes's own configured
+        default' (this module's own long-standing documented contract,
+        see HERMES_RUNNER_MODEL's docstring) -- fails closed to Hermes's
+        own config.yaml default, never crashes the relay call itself."""
+        with patch.object(server, "HERMES_RUNNER_WHATSAPP_ADMIN_MODEL", ""), \
+             patch.object(server, "HERMES_RUNNER_WHATSAPP_ADMIN_PROVIDER", ""):
+            mock_run.return_value = self._fake_result()
+            server.run_hermes(None, "check bridge health", "helpful", force_mode="READ",
+                               readonly_key="readonly:whatsapp_relay")
+            cmd = mock_run.call_args[0][0]
+        self.assertNotIn("-m", cmd)
+        self.assertNotIn("--provider", cmd)
+
+    @patch("server.subprocess.run")
+    def test_9_admin_idempotency_untouched_by_model_change(self, mock_run):
+        """This model/provider change is orthogonal to fazle-core's
+        ADMIN-RELAY-IDEMPOTENCY fix (core@0268042/23af55c) -- confirms the
+        toolset/readonly_key wiring this relies on (RUN toolset regardless
+        of mode) is unaffected by which model is configured."""
+        mock_run.return_value = self._fake_result()
+        server.run_hermes(None, "check bridge health", "helpful",
+                           readonly_key="readonly:whatsapp_relay")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-t") + 1], server.MODE_TOOLSETS["RUN"])
+        # Case 10 (one inbound message -> at most one visible reply) is a
+        # fazle-core-side property (the in-flight lock + dispatch-scoped
+        # idempotency key in modules.admin_directives.router), not
+        # something hermes-runner's own model selection can prove or
+        # break -- covered by that repo's own test suite
+        # (tests/unit/test_admin_ai_router.py), not duplicated here.
 
 
 class TestRunHermesWhatsAppAdminToolsetOverride(unittest.TestCase):
