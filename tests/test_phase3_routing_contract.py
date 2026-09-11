@@ -225,3 +225,9 @@ def test_failure_taxonomy_uses_phase3b_canonical_values():
     assert FailureClass.INVALID_REQUEST_OR_POLICY_REJECTION.value == "invalid_request_or_policy_rejection"
     assert FailureClass.INTERNAL_APPLICATION_DEFECT.value == "internal_application_defect"
     assert FailureClass.UNKNOWN_UNCLASSIFIED.value == "unknown_unclassified"
+
+
+def test_unknown_unclassified_is_fail_closed_not_silent_fallback():
+    assert failure_action(
+        FailureClass.UNKNOWN_UNCLASSIFIED, retry_eligible=True
+    ) is FailureAction.FAIL_CLOSED

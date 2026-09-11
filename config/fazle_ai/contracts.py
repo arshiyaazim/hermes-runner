@@ -259,6 +259,7 @@ def failure_action(
         FailureClass.SAFETY_REFUSAL,
         FailureClass.INVALID_REQUEST,
         FailureClass.POLICY_REJECTION,
+        FailureClass.UNKNOWN_UNCLASSIFIED,
     }:
         return FailureAction.FAIL_CLOSED
     if failure_class is FailureClass.INTERNAL_APPLICATION_DEFECT:
@@ -270,7 +271,6 @@ def failure_action(
         FailureClass.MODEL_UNAVAILABLE,
         FailureClass.PROVIDER_UNAVAILABLE,
         FailureClass.CONTEXT_LENGTH_EXCEEDED,
-        FailureClass.UNKNOWN,
     }:
         return FailureAction.NEXT_ROUTE
     if not retry_eligible:
