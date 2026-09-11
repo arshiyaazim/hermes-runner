@@ -1,0 +1,81 @@
+# Workload: hermes-runner
+# --------------------------------------------------------------------------
+# The Owner/Admin-facing HTTP shim that invokes Hermes CLI for coding
+# workflow. Non-secret policy only. Secret values live ONLY in the
+# runtime's secrets.env (or, in a future Vault deployment, in Vault at
+# vault://fazle-ai/workloads/hermes-runner/<name>).
+#
+# IMPORTANT: each `model` entry must be the full provider/model key
+# (matching the global policy allowlist, e.g. "claude/claude-opus-4-6"
+# not "claude-opus-4-6"). The loader treats the model string as opaque
+# and matches it exactly against the policy allowlist.
+# --------------------------------------------------------------------------
+
+version: "1.0"
+environment: production
+
+workload:
+  name: hermes-runner
+  enabled: true
+  description: "Owner/Admin-facing HTTP shim that calls hermes chat subprocess for coding workflow."
+
+# Provider + model preference order. ONLY allowlisted models are usable.
+# Each entry's model must match a value in the global policy allowlist.
+# Order is significant: this list doubles as the fallback chain.
+fallback_chain:
+  - provider: omniroute
+    model: claude/claude-opus-4-6
+  - provider: omniroute
+    model: claude/claude-sonnet-4-6
+  - provider: omniroute
+    model: gemini/gemini-3.1-flash-lite
+  - provider: omniroute
+    model: moonshot/kimi-k2.7-code
+  - provider: omniroute
+    model: groq/llama-3.3-70b-versatile
+  - provider: ollama-local
+    model: ollama-local/qwen3:8b
+
+# Explicit allow/deny. If `deny_patterns` is present it is checked AFTER
+# the global policy.yaml deny_patterns (union).
+model_allowlist: []   # empty == inherit global allow_models from policy.yaml
+model_deny_patterns:
+  - "auto/*"            # belt + suspenders: explicitly deny in workload even if global is later edited
+  - "*/cc/cc-*"
+
+# Timeouts (per-workload overrides; must tighten, never loosen, defaults).
+# NOTE: the loader requires integer values; YAML booleans or strings fail.
+timeouts:
+  request_timeout_s: 30
+  connect_timeout_s: 5
+  read_budget_total_s: 300   # matches hermes-runner's existing HERMES_RUN_TIMEOUT=300
+
+# Per-workload retry budget cap. The executor inside policy_loader + retry_policy.py
+# enforces: max_attempts_per_fallback_target <= max_attempts_same_target from the policy.
+retry_budget:
+  max_attempts_per_fallback_target: 2
+  total_max_attempts_across_chain: 10   # hard cap; executor fails closed at this limit
+
+# Per-workload logging controls (cannot disable the no-secret invariant).
+logging:
+  log_provider_model_identifiers: true
+  log_failure_class: true
+  log_attempt_count: true
+  log_request_authorization_headers: false    # hard rule
+  log_secret_values: false                   # hard rule
+
+# Secret refs (NO VALUES HERE — names only).
+# Resolver walks: runtime secrets.env -> (future) Vault -> (fallback) fail-closed with operator-visible error.
+secret_refs:
+  omniroute_api_key: "vault://fazle-ai/workloads/hermes-runner/omniroute-api-key"
+  tavily_api_key: "vault://fazle-ai/workloads/hermes-runner/tavily-api-key"
+  hermes_runner_secret: "vault://fazle-ai/workloads/hermes-runner/runner-secret"
+  hermes_runner_customer_secret: "vault://fazle-ai/workloads/hermes-runner/runner-customer-secret"
+
+# Backward-compatibility knobs (only effective when policy_loader is active).
+# When set to true (default), absence of this YAML = use the existing
+# environment-only configuration unchanged. Disable only after explicit
+# Owner approval for a full cutover.
+backward_compat:
+  inherit_env_defaults_when_policy_absent: true
+  fail_closed_on_invalid_policy: true

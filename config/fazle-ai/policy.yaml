@@ -1,0 +1,168 @@
+# Fazle-AI global routing policy (non-secret)
+# --------------------------------------------------------------------------
+# This file contains NO secrets. It is the version-controlled policy of
+# record. Every value here is either:
+#   - a model id (string, no credentials),
+#   - a provider name (string, no credentials),
+#   - a numeric timeout / retry budget,
+#   - a glob-style allow/deny pattern,
+#   - a workload name reference (string, no credentials), or
+#   - a "vault://..." URI that names a credential without containing it.
+#
+# Owner-approved implementation rule (2026-08-25, task #22): every AI routing
+# decision in this ecosystem reads THIS file before talking to a provider.
+# Secrets are resolved separately via the per-app secrets.env file (see
+# config/fazle-ai/examples/secrets.env.example for the reference schema).
+#
+# Validation is performed by config.policy_loader.load_policy(); any model
+# string matching the deny_patterns below is rejected at load time with a
+# non-secret ValidationError. The "auto/*" tree is the canonical example:
+# per the prior audit, the OmniRoute auto-dispatcher has a 0% success rate
+# today, and silently falling through to it has caused multiple production
+# hangs. It must never be loadable as a routing target from this file.
+# --------------------------------------------------------------------------
+
+version: "1.0"
+environment: production   # one of: dev | staging | production
+
+# ── Default timeouts / budgets (seconds) ──────────────────────────────────
+# All values are integers. Per-workload overrides may tighten (never
+# loosen) these. Bounded values only.
+defaults:
+  request_timeout_s: 30        # wall clock per single HTTP call to a provider
+  connect_timeout_s: 5         # TCP connect budget per provider call
+  read_budget_total_s: 300     # cap on TOTAL runtime of a single request across the full fallback chain
+
+# ── Retry policy (machine-readable matrix; mirrored in retry_policy.py) ───
+# Owner-approved rule (task #22, 2026-08-25):
+#   * NETWORK_TIMEOUT and TRANSIENT_5XX: attempt once, retry the same
+#     target AT MOST ONCE, then immediately advance to next fallback.
+#     max_attempts_same_target=2 means "1 original + 1 retry".
+#     backoff_s[0]=2 is the ONLY backoff value used for these classes.
+#   * RATE_LIMITED: see dedicated policy block below.
+#   * QUOTA_EXHAUSTED, PROVIDER_OR_MODEL_UNAVAILABLE, AUTH/INVALID/etc.:
+#     max_attempts_same_target=0 (no retry, fail closed or skip).
+retry_policy:
+  network_timeout_or_transient_5xx:
+    max_attempts_same_target: 2     # 1 original + 1 retry, NOT 2 retries
+    backoff_s: [2]                  # single backoff value used for the one retry
+  rate_limited:
+    # See the explicit retry_after_safe_maximum_s below for the
+    # actually enforced policy. The base rule is: retry once if
+    # Retry-After is present and within the safe max; otherwise skip.
+    max_attempts_same_target: 2     # 1 original + 1 retry (one shot)
+    backoff_s: [2]                  # default backoff when Retry-After absent/invalid
+  quota_exhausted:
+    max_attempts_same_target: 0     # do not retry; immediately try next fallback
+  provider_or_model_unavailable:
+    max_attempts_same_target: 0
+  context_too_large:
+    max_attempts_same_target: 1     # 1 retry after truncation; then skip
+    backoff_s: [1]
+  auth_or_authorization_failed:
+    max_attempts_same_target: 0     # fail closed; never retry, never switch credentials
+  invalid_request_or_policy_or_safety_refusal:
+    max_attempts_same_target: 0     # never retry; never bypass the refusal
+
+# ── Rate-limit (429) extra policy ──────────────────────────────────────
+# Owner rule: respect Retry-After ONLY if it is bounded by the safe
+# maximum below; otherwise skip directly to next fallback.
+rate_limit_policy:
+  retry_after_safe_maximum_s: 30    # any Retry-After value above this is treated as absent
+  honor_retry_after_if_within_max: true
+  one_shot: true                    # at most one retry on a 429, ever
+
+# ── Model policy ───────────────────────────────────────────────────────────
+model_policy:
+  mode: allowlist                  # ONLY models in `allow_models` are usable
+  deny_patterns:
+    - "auto/*"                      # per audit; auto-dispatcher at 0% success
+    - "*/cc/cc-*"                   # malformed cc/cc/... namespace entries seen in OmniRoute catalog
+    - "*-low-thinking"              # truncated-experiment models with no upstream backing
+  allow_models:
+    # ── Anthropic via OmniRoute (Claude Code OAuth) ─────────────────────
+    - "claude/claude-opus-4-6"
+    - "claude/claude-sonnet-4-6"
+    - "claude/claude-haiku-4-5-20251001"
+    - "claude/claude-opus-4-5-20251101"
+    # ── Gemini direct via OmniRoute ──────────────────────────────────────
+    - "gemini/gemini-3.1-flash-lite"
+    - "gemini/gemini-3.1-pro-preview"
+    - "gemini/gemini-3-flash-preview"
+    # ── Kimi direct via OmniRoute ────────────────────────────────────────
+    - "moonshot/kimi-k2.6"
+    - "moonshot/kimi-k2.7-code"
+    - "moonshot/kimi-k3"
+    # ── Groq direct via OmniRoute ────────────────────────────────────────
+    - "groq/llama-3.3-70b-versatile"
+    - "groq/llama-3.1-8b-instant"
+    # ── Local Ollama (no quota, free) ───────────────────────────────────
+    - "ollama-local/phi4-mini"
+    - "ollama-local/qwen3:8b"
+    - "ollama-local/hermes3:3b"
+
+# ── Per-provider limits ────────────────────────────────────────────────────
+provider_limits:
+  omniroute:
+    requests_per_minute: 600       # soft advisory only; OmniRoute enforces own quotas
+  ollama-local:
+    max_concurrent: 1
+  github-models:
+    requests_per_minute: 60        # GitHub's per-token cap is far lower; soft advisory
+
+# ── Shared policy defaults (applied unless workload overrides) ─────────────
+shared:
+  log_provider_model_identifiers: true      # log "provider=X model=Y" on every attempt
+  log_request_authorization_headers: false   # NEVER log auth headers
+  log_secret_values: false                  # NEVER log secrets
+  fail_closed_on_auth_failure: true
+  emit_health_signal_on_auth_failure: true  # external monitoring hook
+
+# ── Decision table (machine-readable; see retry_policy.py for the executor) ──
+fallback_decision_table:
+  - if:
+      failure_class: network_timeout
+      action: retry_same_target_with_backoff_then_next
+  - if:
+      failure_class: transient_5xx
+      action: retry_same_target_with_backoff_then_next
+  - if:
+      failure_class: rate_limited
+      action: honor_retry_after_if_present_then_next
+  - if:
+      failure_class: quota_exhausted
+      action: skip_to_next_without_retry
+  - if:
+      failure_class: provider_or_model_unavailable
+      action: skip_to_next_without_retry
+  - if:
+      failure_class: context_too_large
+      action: truncate_and_retry_once_then_next
+  - if:
+      failure_class: authentication_failed
+      action: fail_closed_no_retry_no_fallback_to_other_credential
+  - if:
+      failure_class: authorization_failed
+      action: fail_closed_no_retry_no_fallback_to_other_credential
+  - if:
+      failure_class: invalid_request
+      action: fail_closed_no_retry_no_fallback
+  - if:
+      failure_class: policy_rejection
+      action: fail_closed_no_retry_no_fallback
+  - if:
+      failure_class: safety_refusal
+      action: fail_closed_no_retry_no_fallback
+  - if:
+      failure_class: all_routes_exhausted
+      action: emit_final_error_with_visited_set_and_fail_clearly
+
+# ── Reference schema for workload secret_refs (no real values) ─────────────
+# Real workloads (config/fazle-ai/workloads/*.yaml) reference these by name.
+# The values live ONLY in each app's secrets.env (never committed), or in a
+# future Vault deployment.
+secret_ref_schema:
+  omniroute_api_key: "vault://fazle-ai/workloads/{workload_name}/omniroute-api-key"
+  hermes_runner_api_key: "vault://fazle-ai/workloads/{workload_name}/hermes-runner-api-key"
+  minimax_api_key: "vault://fazle-ai/workloads/{workload_name}/minimax-api-key"
+  groq_api_key: "vault://fazle-ai/workloads/{workload_name}/groq-api-key"
