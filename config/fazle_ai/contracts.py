@@ -49,21 +49,33 @@ class TransportKind(str, Enum):
 
 
 class FailureClass(str, Enum):
-    AUTHENTICATION_FAILED = "authentication_failed"
-    AUTHORIZATION_FAILED = "authorization_failed"
-    QUOTA_EXHAUSTED = "quota_exhausted"
+    AUTHENTICATION_FAILURE = "authentication_failure"
+    AUTHORIZATION_FAILURE = "authorization_failure"
+    QUOTA_CREDIT_EXHAUSTED = "quota_credit_exhausted"
     RATE_LIMITED = "rate_limited"
-    MODEL_UNAVAILABLE = "model_unavailable"
-    PROVIDER_UNAVAILABLE = "provider_unavailable"
-    PROVIDER_OUTAGE = "provider_outage"
+    PROVIDER_OR_MODEL_UNAVAILABLE = "provider_or_model_unavailable"
+    PROVIDER_OUTAGE_OR_5XX = "provider_outage_or_5xx"
     TIMEOUT = "timeout"
-    MALFORMED_RESPONSE = "malformed_response"
+    MALFORMED_PROVIDER_RESPONSE = "malformed_provider_response"
     CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
-    SAFETY_REFUSAL = "safety_refusal"
-    INVALID_REQUEST = "invalid_request"
-    POLICY_REJECTION = "policy_rejection"
+    SAFETY_OR_PROVIDER_REFUSAL = "safety_or_provider_refusal"
+    INVALID_REQUEST_OR_POLICY_REJECTION = "invalid_request_or_policy_rejection"
     INTERNAL_APPLICATION_DEFECT = "internal_application_defect"
-    UNKNOWN = "unknown"
+    UNKNOWN_UNCLASSIFIED = "unknown_unclassified"
+
+    # Transitional source-compatible aliases. Structured audits always emit
+    # the canonical values above.
+    AUTHENTICATION_FAILED = AUTHENTICATION_FAILURE
+    AUTHORIZATION_FAILED = AUTHORIZATION_FAILURE
+    QUOTA_EXHAUSTED = QUOTA_CREDIT_EXHAUSTED
+    MODEL_UNAVAILABLE = PROVIDER_OR_MODEL_UNAVAILABLE
+    PROVIDER_UNAVAILABLE = PROVIDER_OR_MODEL_UNAVAILABLE
+    PROVIDER_OUTAGE = PROVIDER_OUTAGE_OR_5XX
+    MALFORMED_RESPONSE = MALFORMED_PROVIDER_RESPONSE
+    SAFETY_REFUSAL = SAFETY_OR_PROVIDER_REFUSAL
+    INVALID_REQUEST = INVALID_REQUEST_OR_POLICY_REJECTION
+    POLICY_REJECTION = INVALID_REQUEST_OR_POLICY_REJECTION
+    UNKNOWN = UNKNOWN_UNCLASSIFIED
 
 
 class FailureAction(str, Enum):
@@ -134,6 +146,12 @@ class RouteCandidate:
     max_context_tokens: int
     privacy_classes: frozenset[PrivacyClass]
     credential_ref: str
+    allowed_workloads: frozenset[str]
+    enabled: bool
+    environments: frozenset[str]
+    max_attempts_same_route: int = 2
+    transient_backoff_s: float = 2.0
+    retry_after_safe_maximum_s: float = 30.0
 
     def __post_init__(self) -> None:
         _validate_identifier(self.route_id, "route_id")
@@ -146,8 +164,16 @@ class RouteCandidate:
             raise ValueError("latency_classes must not be empty")
         if not self.privacy_classes:
             raise ValueError("privacy_classes must not be empty")
+        if not self.allowed_workloads or not all(_IDENTIFIER_RE.fullmatch(v) for v in self.allowed_workloads):
+            raise ValueError("allowed_workloads must contain safe identifiers")
+        if not self.environments or not all(_IDENTIFIER_RE.fullmatch(v) for v in self.environments):
+            raise ValueError("environments must contain safe identifiers")
         if self.max_context_tokens <= 0:
             raise ValueError("max_context_tokens must be positive")
+        if self.max_attempts_same_route < 1 or self.max_attempts_same_route > 3:
+            raise ValueError("max_attempts_same_route must be between 1 and 3")
+        if self.transient_backoff_s < 0 or self.retry_after_safe_maximum_s < 0:
+            raise ValueError("retry timing must be non-negative")
         credential_lower = (self.credential_ref or "").strip().lower()
         if (
             not _IDENTIFIER_RE.fullmatch(self.credential_ref or "")
@@ -156,8 +182,17 @@ class RouteCandidate:
             raise ValueError("credential_ref must be a non-secret reference name")
 
 
-def _incompatibilities(request: InferenceRequest, route: RouteCandidate) -> tuple[str, ...]:
+def _incompatibilities(
+    request: InferenceRequest, route: RouteCandidate, *, environment: str,
+    available_credential_refs: frozenset[str] | None,
+) -> tuple[str, ...]:
     reasons: list[str] = []
+    if not route.enabled:
+        reasons.append("disabled")
+    if environment not in route.environments:
+        reasons.append("environment")
+    if request.workload not in route.allowed_workloads:
+        reasons.append("workload")
     if not request.required_capabilities.issubset(route.capabilities):
         reasons.append("capability")
     if _COST_RANK[route.cost_class] > _COST_RANK[request.max_cost_class]:
@@ -168,12 +203,17 @@ def _incompatibilities(request: InferenceRequest, route: RouteCandidate) -> tupl
         reasons.append("context")
     if request.privacy_class not in route.privacy_classes:
         reasons.append("privacy")
+    if available_credential_refs is not None and route.credential_ref not in available_credential_refs:
+        reasons.append("credential")
     return tuple(reasons)
 
 
 def resolve_eligible_routes(
     request: InferenceRequest,
     routes: Iterable[RouteCandidate],
+    *,
+    environment: str = "development",
+    available_credential_refs: frozenset[str] | None = None,
 ) -> tuple[RouteCandidate, ...]:
     """Filter in policy order, rejecting unsafe/incompatible downgrades.
 
@@ -188,7 +228,10 @@ def resolve_eligible_routes(
         if route.route_id in seen:
             raise ValueError(f"duplicate route_id {route.route_id!r}")
         seen.add(route.route_id)
-        reasons = _incompatibilities(request, route)
+        reasons = _incompatibilities(
+            request, route, environment=environment,
+            available_credential_refs=available_credential_refs,
+        )
         if reasons:
             rejected.append(f"{route.route_id}: {','.join(reasons)}")
             continue
@@ -250,6 +293,8 @@ def build_attempt_audit(
     failure_class: FailureClass | None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    fallback_decision: FailureAction | None = None,
+    diagnostic: str | None = None,
 ) -> dict[str, object]:
     """Build safe structured metadata; credential references are omitted."""
 
@@ -278,4 +323,6 @@ def build_attempt_audit(
         "output_tokens": output_tokens,
         "outcome": outcome.value,
         "failure_class": failure_class.value if failure_class else None,
+        "fallback_decision": fallback_decision.value if fallback_decision else None,
+        "diagnostic": diagnostic,
     }

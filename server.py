@@ -78,12 +78,16 @@ hermes-runner restart, only its own on-disk Hermes session does (a fresh
 caller falls back to starting a new conversation, not an error state).
 """
 
+import contextvars
+import contextlib
 import datetime
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -259,6 +263,68 @@ HERMES_RUNNER_READ_PROVIDER = os.environ.get("HERMES_RUNNER_READ_PROVIDER", "omn
 # for the full analysis (raising this process's timeout alone, without the
 # outward chain, would have reproduced the exact 2026-08-06 incident).
 TIMEOUT_SECONDS = int(os.environ.get("HERMES_RUN_TIMEOUT", "300"))
+
+# Phase 3B unified routing is deliberately default-off. Authorization/mode/
+# toolset selection happens before this branch and is never read from policy.
+PHASE3_ROUTING_ENABLED = os.environ.get("POLICIES_ENABLED", "false").lower() == "true"
+PHASE3_ROUTING_WORKLOAD_FILE = os.environ.get(
+    "HERMES_RUNNER_ROUTING_WORKLOAD_FILE",
+    os.path.join(os.path.dirname(__file__), "config/fazle-ai/workloads/hermes-runner.yaml"),
+)
+PHASE3_ROUTING_ENVIRONMENT = os.environ.get("FAZLE_AI_ENVIRONMENT", "production")
+_LAST_ROUTING_AUDITS = contextvars.ContextVar("hermes_runner_last_routing_audits", default=())
+
+
+def get_last_routing_audits():
+    """Safe attempt metadata for the current request context."""
+    return list(_LAST_ROUTING_AUDITS.get())
+
+
+def _phase3_available_credential_refs():
+    refs = {"local_runtime"}
+    if os.environ.get("OMNIROUTE_API_KEY") or os.environ.get("HERMES_CUSTOM_127_0_0_1_20128_API_KEY"):
+        refs.add("omniroute_api_key")
+    return frozenset(refs)
+
+
+@contextlib.contextmanager
+def _phase3_no_fallback_profile(env):
+    """Mirror the active Hermes profile but remove its provider fallbacks.
+
+    Hermes one-shot loads ``fallback_providers`` from its profile even when
+    ``-m`` and ``--provider`` are explicit.  The Phase 3 executor must be the
+    sole retry/fallback owner, so routed invocations receive an ephemeral
+    profile whose config preserves tool/MCP/security settings but contains no
+    fallback chain.  Existing state (sessions, credentials, plugin state) is
+    linked, not copied, and the source profile is never modified.
+    """
+    import yaml
+
+    source_home = Path(env.get("HERMES_HOME") or os.path.expanduser("~/.hermes")).resolve()
+    source_config = source_home / "config.yaml"
+    if not source_config.is_file():
+        raise RuntimeError("Hermes routing profile config is unavailable")
+    with source_config.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    if not isinstance(config, dict):
+        raise RuntimeError("Hermes routing profile config is invalid")
+    config.pop("fallback_providers", None)
+    config.pop("fallback_model", None)
+
+    with tempfile.TemporaryDirectory(prefix="fazle-phase3-hermes-") as temp_home_value:
+        temp_home = Path(temp_home_value)
+        os.chmod(temp_home, 0o700)
+        routed_config = temp_home / "config.yaml"
+        with routed_config.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(config, handle, sort_keys=False)
+        os.chmod(routed_config, 0o600)
+        for entry in source_home.iterdir():
+            if entry.name == "config.yaml":
+                continue
+            (temp_home / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+        routed_env = dict(env)
+        routed_env["HERMES_HOME"] = str(temp_home)
+        yield routed_env
 
 # ── Stale-call watchdog fix (2026-08-06 root-cause fix, see incident write-
 # up "Hermes web chat: did not respond in time") ────────────────────────────
@@ -1093,6 +1159,81 @@ def _record_schema_probe_halts(stderr_text: str, session_id) -> None:
         })
 
 
+def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
+    """Run one policy-owned inference lifecycle; never performs delivery."""
+    from config.fazle_ai.failure_classifier import (
+        classify_provider_failure,
+        retry_after_seconds,
+        safe_diagnostic,
+    )
+    from config.fazle_ai.contracts import FailureClass, NoCompatibleRoute
+    from config.fazle_ai.route_loader import load_routing_plan
+    from config.fazle_ai.router import ProviderResult, RoutingEngine, RoutingExhausted
+
+    try:
+        plan = load_routing_plan(PHASE3_ROUTING_WORKLOAD_FILE)
+        request = plan.new_request(
+            correlation_ref=f"session:{session_id or 'new'}",
+            context_version="runner-context-v1",
+        )
+    except Exception as exc:
+        _LAST_ROUTING_AUDITS.set(())
+        return None, f"Routing policy invalid: {type(exc).__name__}", None
+
+    successful_process = None
+    routed_env = None
+
+    def invoke(route, attempt_number):
+        nonlocal successful_process
+        provider = "ollama" if route.provider == "ollama-local" else route.provider
+        cmd = list(base_cmd) + ["-m", route.model, "--provider", provider]
+        if session_id:
+            cmd += ["--resume", session_id]
+        result, timed_out, crash_detail = _run_hermes_once(
+            cmd, routed_env, TIMEOUT_SECONDS, session_id=session_id, persona=persona, cwd=cwd
+        )
+        if timed_out:
+            return ProviderResult.failure(FailureClass.TIMEOUT)
+        if crash_detail is not None:
+            return ProviderResult.failure(FailureClass.INTERNAL_APPLICATION_DEFECT)
+        diagnostic = (result.stderr or result.stdout or "") if result else ""
+        if result is None or result.returncode != 0:
+            failure = classify_provider_failure(diagnostic)
+            return ProviderResult.failure(
+                failure, retry_after_s=retry_after_seconds(diagnostic),
+                safe_detail=safe_diagnostic(diagnostic),
+            )
+        if not (result.stdout or "").strip():
+            return ProviderResult.failure(FailureClass.MALFORMED_PROVIDER_RESPONSE)
+        successful_process = result
+        return ProviderResult.success((result.stdout or "").strip())
+
+    try:
+        with _phase3_no_fallback_profile(env) as routed_env:
+            routed = RoutingEngine(
+                plan.routes,
+                environment=PHASE3_ROUTING_ENVIRONMENT,
+                available_credential_refs=_phase3_available_credential_refs(),
+                sleep=time.sleep,
+            ).execute(request, invoke)
+    except NoCompatibleRoute as exc:
+        _LAST_ROUTING_AUDITS.set(())
+        return None, f"No compatible route: {exc}", FailureClass.INVALID_REQUEST_OR_POLICY_REJECTION
+    except RoutingExhausted as exc:
+        _LAST_ROUTING_AUDITS.set(exc.attempt_audits)
+        for audit in exc.attempt_audits:
+            _log(f"routing_attempt {json.dumps(audit, sort_keys=True, separators=(',', ':'))}")
+        return None, f"Unified routing exhausted: {exc.failure_class.value}", exc.failure_class
+    except Exception as exc:
+        _LAST_ROUTING_AUDITS.set(())
+        return None, f"Unified routing internal failure: {type(exc).__name__}", FailureClass.INTERNAL_APPLICATION_DEFECT
+
+    _LAST_ROUTING_AUDITS.set(routed.attempt_audits)
+    for audit in routed.attempt_audits:
+        _log(f"routing_attempt {json.dumps(audit, sort_keys=True, separators=(',', ':'))}")
+    return successful_process, None, None
+
+
 def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None, readonly_key=None):
     """force_mode (Phase 4, 2026-08-04): when set, use that mode's toolset
     for THIS call only — does not read or write the persisted mode file, so
@@ -1182,12 +1323,13 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
         model, provider = HERMES_RUNNER_READ_MODEL, HERMES_RUNNER_READ_PROVIDER
     else:
         model, provider = HERMES_RUNNER_MODEL, HERMES_RUNNER_PROVIDER
-    if model:
-        cmd += ["-m", model]
-    if provider:
-        cmd += ["--provider", provider]
-    if hermes_session_id:
-        cmd += ["--resume", hermes_session_id]
+    if not PHASE3_ROUTING_ENABLED:
+        if model:
+            cmd += ["-m", model]
+        if provider:
+            cmd += ["--provider", provider]
+        if hermes_session_id:
+            cmd += ["--resume", hermes_session_id]
 
     # See STALE_CALL_TIMEOUT_SECONDS' definition above for why this is set.
     env = {**os.environ, "HERMES_API_CALL_STALE_TIMEOUT": STALE_CALL_TIMEOUT_SECONDS}
@@ -1202,9 +1344,19 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
         else None
     )
 
-    result, timed_out, crash_detail = _run_hermes_once(
-        cmd, env, TIMEOUT_SECONDS, session_id=hermes_session_id, persona=persona, cwd=cwd
-    )
+    if PHASE3_ROUTING_ENABLED:
+        result, routing_error, _failure_class = _run_with_phase3_routing(
+            cmd, env, session_id=hermes_session_id, persona=persona, cwd=cwd
+        )
+        if routing_error is not None:
+            return None, None, routing_error, mode
+        timed_out = False
+        crash_detail = None
+    else:
+        _LAST_ROUTING_AUDITS.set(())
+        result, timed_out, crash_detail = _run_hermes_once(
+            cmd, env, TIMEOUT_SECONDS, session_id=hermes_session_id, persona=persona, cwd=cwd
+        )
     if timed_out:
         return None, None, "Earth did not respond in time", mode
     if crash_detail is not None:

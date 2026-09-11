@@ -58,6 +58,9 @@ def _route(route_id: str, **overrides) -> RouteCandidate:
         "max_context_tokens": 32_000,
         "privacy_classes": frozenset({PrivacyClass.PRIVATE_GATEWAY, PrivacyClass.APPROVED_EXTERNAL}),
         "credential_ref": "omniroute_api_key",
+        "allowed_workloads": frozenset({"conversational_reply"}),
+        "enabled": True,
+        "environments": frozenset({"development", "test", "production"}),
     }
     values.update(overrides)
     return RouteCandidate(**values)
@@ -109,6 +112,26 @@ def test_privacy_restriction_rejects_external_route():
     with pytest.raises(NoCompatibleRoute) as exc:
         resolve_eligible_routes(_request(privacy_class=PrivacyClass.LOCAL_ONLY), (external,))
     assert "privacy" in str(exc.value)
+
+
+def test_disabled_wrong_environment_and_wrong_workload_routes_are_rejected():
+    routes = (
+        _route("disabled", enabled=False),
+        _route("staging", environments=frozenset({"staging"})),
+        _route("other", allowed_workloads=frozenset({"structured_extraction"})),
+    )
+    with pytest.raises(NoCompatibleRoute) as exc:
+        resolve_eligible_routes(_request(), routes, environment="development")
+    assert all(word in str(exc.value) for word in ("disabled", "environment", "workload"))
+
+
+def test_unavailable_credential_is_rejected_before_provider_call():
+    with pytest.raises(NoCompatibleRoute) as exc:
+        resolve_eligible_routes(
+            _request(), (_route("missing"),),
+            available_credential_refs=frozenset(),
+        )
+    assert "credential" in str(exc.value)
 
 
 def test_fallback_disabled_returns_only_first_compatible_route():
@@ -164,6 +187,8 @@ def test_attempt_audit_contains_required_safe_routing_fields():
         "output_tokens": 12,
         "outcome": "success",
         "failure_class": None,
+        "fallback_decision": None,
+        "diagnostic": None,
     }
     assert "credential_ref" not in audit
     assert not any("key" in name or "secret" in name or "authorization" in name for name in audit)
@@ -188,3 +213,15 @@ def test_empty_workload_and_route_identifiers_are_rejected():
         _request(workload=" ")
     with pytest.raises(ValueError):
         _route(" ")
+
+
+def test_failure_taxonomy_uses_phase3b_canonical_values():
+    assert FailureClass.AUTHENTICATION_FAILURE.value == "authentication_failure"
+    assert FailureClass.QUOTA_CREDIT_EXHAUSTED.value == "quota_credit_exhausted"
+    assert FailureClass.PROVIDER_OR_MODEL_UNAVAILABLE.value == "provider_or_model_unavailable"
+    assert FailureClass.PROVIDER_OUTAGE_OR_5XX.value == "provider_outage_or_5xx"
+    assert FailureClass.MALFORMED_PROVIDER_RESPONSE.value == "malformed_provider_response"
+    assert FailureClass.SAFETY_OR_PROVIDER_REFUSAL.value == "safety_or_provider_refusal"
+    assert FailureClass.INVALID_REQUEST_OR_POLICY_REJECTION.value == "invalid_request_or_policy_rejection"
+    assert FailureClass.INTERNAL_APPLICATION_DEFECT.value == "internal_application_defect"
+    assert FailureClass.UNKNOWN_UNCLASSIFIED.value == "unknown_unclassified"

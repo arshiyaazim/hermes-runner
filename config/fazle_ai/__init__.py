@@ -43,6 +43,12 @@ from config.fazle_ai.retry_policy import (
     decide_retry,
     execute_with_retries,
 )
+from config.fazle_ai.router import (
+    ProviderResult,
+    RoutingEngine,
+    RoutingExhausted,
+    RoutingResult,
+)
 
 __all__ = [
     "AttemptOutcome",
@@ -59,7 +65,11 @@ __all__ = [
     "RetryDecision",
     "RetryRule",
     "PrivacyClass",
+    "ProviderResult",
     "RouteCandidate",
+    "RoutingEngine",
+    "RoutingExhausted",
+    "RoutingResult",
     "SecretRef",
     "TransportKind",
     "WorkloadConfig",
