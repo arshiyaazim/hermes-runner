@@ -217,6 +217,22 @@ def test_versioned_workload_policy_loads_request_defaults_and_explicit_routes():
     assert all(route.credential_ref for route in plan.routes)
 
 
+def test_every_policy_route_declares_compatibility_and_retry_ownership():
+    import yaml
+
+    with open("config/fazle-ai/workloads/hermes-runner.yaml", encoding="utf-8") as handle:
+        routes = yaml.safe_load(handle)["routing_contract"]["routes"]
+    required = {
+        "route_id", "provider", "model", "transport", "capabilities",
+        "cost_class", "latency_classes", "max_context_tokens",
+        "privacy_classes", "credential_ref", "allowed_workloads", "enabled",
+        "environments", "max_attempts_same_route", "transient_backoff_s",
+        "retry_after_safe_maximum_s",
+    }
+    assert routes
+    assert all(required.issubset(route) for route in routes)
+
+
 def test_enabled_policy_rejects_route_metadata_missing_required_fields(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text("version: '1.0'\nrouting_contract: {workload: x}\n", encoding="utf-8")

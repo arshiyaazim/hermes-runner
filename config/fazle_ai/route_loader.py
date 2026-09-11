@@ -57,7 +57,16 @@ def load_routing_plan(path: str) -> RoutingPlan:
         "retry_eligible": block["retry_eligible"],
     }
     routes = []
+    route_required = {
+        "route_id", "provider", "model", "transport", "capabilities",
+        "cost_class", "latency_classes", "max_context_tokens",
+        "privacy_classes", "credential_ref", "allowed_workloads", "enabled",
+        "environments", "max_attempts_same_route", "transient_backoff_s",
+        "retry_after_safe_maximum_s",
+    }
     for item in block["routes"]:
+        if not isinstance(item, dict) or not route_required.issubset(item):
+            raise ValueError("routing route is missing explicit fields")
         routes.append(RouteCandidate(
             route_id=item["route_id"], provider=item["provider"], model=item["model"],
             transport=TransportKind(item["transport"]),
@@ -67,12 +76,12 @@ def load_routing_plan(path: str) -> RoutingPlan:
             max_context_tokens=int(item["max_context_tokens"]),
             privacy_classes=_enum_set(PrivacyClass, item["privacy_classes"], "privacy_classes"),
             credential_ref=item["credential_ref"],
-            allowed_workloads=frozenset(item.get("allowed_workloads", [block["workload"]])),
-            enabled=bool(item.get("enabled", True)),
-            environments=frozenset(item.get("environments", ["development", "test", "production"])),
-            max_attempts_same_route=int(item.get("max_attempts_same_route", 2)),
-            transient_backoff_s=float(item.get("transient_backoff_s", 2)),
-            retry_after_safe_maximum_s=float(item.get("retry_after_safe_maximum_s", 30)),
+            allowed_workloads=frozenset(item["allowed_workloads"]),
+            enabled=bool(item["enabled"]),
+            environments=frozenset(item["environments"]),
+            max_attempts_same_route=int(item["max_attempts_same_route"]),
+            transient_backoff_s=float(item["transient_backoff_s"]),
+            retry_after_safe_maximum_s=float(item["retry_after_safe_maximum_s"]),
         ))
     if not routes:
         raise ValueError("routing_contract.routes must not be empty")
