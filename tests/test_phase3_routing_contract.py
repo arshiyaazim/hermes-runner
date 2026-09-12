@@ -208,6 +208,16 @@ def test_route_requires_non_secret_credential_reference_name():
         _route("bad-secret", credential_ref="sk-this-is-a-secret-value")
 
 
+def test_openrouter_route_requires_exactly_one_provider_endpoint():
+    with pytest.raises(ValueError, match="provider_endpoints"):
+        _route("openrouter-unpinned", provider="openrouter", provider_endpoints=())
+    with pytest.raises(ValueError, match="provider_endpoints"):
+        _route(
+            "openrouter-multiple", provider="openrouter",
+            provider_endpoints=("open-inference/fp8", "baidu/fp8"),
+        )
+
+
 def test_empty_workload_and_route_identifiers_are_rejected():
     with pytest.raises(ValueError):
         _request(workload=" ")

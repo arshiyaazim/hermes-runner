@@ -180,6 +180,7 @@ class RouteCandidate:
             len(set(self.provider_endpoints)) != len(self.provider_endpoints)
             or any(not endpoint_pattern.fullmatch(value) for value in self.provider_endpoints)
             or (self.provider_endpoints and self.provider != "openrouter")
+            or (self.provider == "openrouter" and len(self.provider_endpoints) != 1)
         ):
             raise ValueError("provider_endpoints must be unique OpenRouter endpoint slugs")
         credential_lower = (self.credential_ref or "").strip().lower()
