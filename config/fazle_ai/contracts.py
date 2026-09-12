@@ -152,6 +152,7 @@ class RouteCandidate:
     max_attempts_same_route: int = 2
     transient_backoff_s: float = 2.0
     retry_after_safe_maximum_s: float = 30.0
+    provider_endpoints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_identifier(self.route_id, "route_id")
@@ -174,6 +175,13 @@ class RouteCandidate:
             raise ValueError("max_attempts_same_route must be between 1 and 3")
         if self.transient_backoff_s < 0 or self.retry_after_safe_maximum_s < 0:
             raise ValueError("retry timing must be non-negative")
+        endpoint_pattern = re.compile(r"^[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?$")
+        if (
+            len(set(self.provider_endpoints)) != len(self.provider_endpoints)
+            or any(not endpoint_pattern.fullmatch(value) for value in self.provider_endpoints)
+            or (self.provider_endpoints and self.provider != "openrouter")
+        ):
+            raise ValueError("provider_endpoints must be unique OpenRouter endpoint slugs")
         credential_lower = (self.credential_ref or "").strip().lower()
         if (
             not _IDENTIFIER_RE.fullmatch(self.credential_ref or "")

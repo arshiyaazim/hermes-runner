@@ -32,13 +32,13 @@ routing_contract:
   fallback_eligible: true
   retry_eligible: true
   routes:
-    - {route_id: openrouter-deepseek-v4-flash, provider: openrouter, model: deepseek/deepseek-v4-flash-0731, transport: direct_provider, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 131072, privacy_classes: [approved_external], credential_ref: openrouter_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 1, transient_backoff_s: 0, retry_after_safe_maximum_s: 30}
-    - {route_id: omniroute-opus, provider: omniroute, model: claude/claude-opus-4-6, transport: private_gateway, capabilities: [text_generation, structured_output, long_context], cost_class: high, latency_classes: [interactive, background], max_context_tokens: 200000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
-    - {route_id: omniroute-sonnet, provider: omniroute, model: claude/claude-sonnet-4-6, transport: private_gateway, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 200000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
-    - {route_id: omniroute-gemini, provider: omniroute, model: gemini/gemini-3.1-flash-lite, transport: private_gateway, capabilities: [text_generation, structured_output, long_context], cost_class: low, latency_classes: [interactive, background, batch], max_context_tokens: 1000000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
-    - {route_id: omniroute-kimi, provider: omniroute, model: moonshot/kimi-k2.7-code, transport: private_gateway, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 128000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
-    - {route_id: omniroute-groq, provider: omniroute, model: groq/llama-3.3-70b-versatile, transport: private_gateway, capabilities: [text_generation, structured_output], cost_class: low, latency_classes: [interactive, background], max_context_tokens: 32000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
-    - {route_id: ollama-qwen, provider: ollama-local, model: ollama-local/qwen3:8b, transport: local, capabilities: [text_generation, structured_output], cost_class: low, latency_classes: [background], max_context_tokens: 8192, privacy_classes: [local_only, private_gateway, approved_external], credential_ref: local_runtime, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
+    - {route_id: openrouter-deepseek-v4-flash, provider: openrouter, model: deepseek/deepseek-v4-flash-0731, provider_endpoints: [open-inference/fp8], transport: direct_provider, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 131072, privacy_classes: [approved_external], credential_ref: openrouter_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 1, transient_backoff_s: 0, retry_after_safe_maximum_s: 30}
+    - {route_id: openrouter-kimi-k3-deepinfra, provider: openrouter, model: moonshotai/kimi-k3, provider_endpoints: [deepinfra/bf16], transport: direct_provider, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 131072, privacy_classes: [approved_external], credential_ref: openrouter_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 1, transient_backoff_s: 0, retry_after_safe_maximum_s: 30}
+    - {route_id: openrouter-deepseek-v4-flash-baidu, provider: openrouter, model: deepseek/deepseek-v4-flash-0731, provider_endpoints: [baidu/fp8], transport: direct_provider, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 131072, privacy_classes: [approved_external], credential_ref: openrouter_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 1, transient_backoff_s: 0, retry_after_safe_maximum_s: 30}
+    - {route_id: openrouter-deepseek-v4-flash-deepinfra, provider: openrouter, model: deepseek/deepseek-v4-flash-0731, provider_endpoints: [deepinfra/fp8], transport: direct_provider, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 131072, privacy_classes: [approved_external], credential_ref: openrouter_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 1, transient_backoff_s: 0, retry_after_safe_maximum_s: 30}
+    # Retained as the final local candidate but disabled: its 8k context is not
+    # capable of this workload's required 32k context and it was not Phase 10 qualified.
+    - {route_id: ollama-qwen, provider: ollama-local, model: ollama-local/qwen3:8b, transport: local, capabilities: [text_generation, structured_output], cost_class: low, latency_classes: [background], max_context_tokens: 8192, privacy_classes: [local_only, private_gateway, approved_external], credential_ref: local_runtime, allowed_workloads: [administrative_reasoning], enabled: false, environments: [development, test, production], max_attempts_same_route: 1, transient_backoff_s: 0, retry_after_safe_maximum_s: 30}
 
 # Provider + model preference order. ONLY allowlisted models are usable.
 # Each entry's model must match a value in the global policy allowlist.
@@ -46,18 +46,8 @@ routing_contract:
 fallback_chain:
   - provider: openrouter
     model: deepseek/deepseek-v4-flash-0731
-  - provider: omniroute
-    model: claude/claude-opus-4-6
-  - provider: omniroute
-    model: claude/claude-sonnet-4-6
-  - provider: omniroute
-    model: gemini/gemini-3.1-flash-lite
-  - provider: omniroute
-    model: moonshot/kimi-k2.7-code
-  - provider: omniroute
-    model: groq/llama-3.3-70b-versatile
-  - provider: ollama-local
-    model: ollama-local/qwen3:8b
+  - provider: openrouter
+    model: moonshotai/kimi-k3
 
 # Explicit allow/deny. If `deny_patterns` is present it is checked AFTER
 # the global policy.yaml deny_patterns (union).

@@ -62,6 +62,7 @@ def load_registry_routes(base_url: str, bearer: str, workload: str):
                 max_attempts_same_route=int(item["max_attempts"]),
                 transient_backoff_s=float(item["retry_backoff_seconds"]),
                 retry_after_safe_maximum_s=30.0,
+                provider_endpoints=tuple(item.get("provider_endpoints") or ()),
             ))
         except (KeyError, TypeError, ValueError):
             raise RegistryUnavailable("registry returned an invalid route") from None
@@ -87,4 +88,3 @@ def resolve_route_credential(base_url: str, bearer: str, workload: str, route, e
     for name in names:
         result[name] = value
     return result
-

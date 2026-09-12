@@ -95,6 +95,7 @@ model_policy:
     - "moonshot/kimi-k2.6"
     - "moonshot/kimi-k2.7-code"
     - "moonshot/kimi-k3"
+    - "moonshotai/kimi-k3"
     # ── Groq direct via OmniRoute ────────────────────────────────────────
     - "groq/llama-3.3-70b-versatile"
     - "groq/llama-3.1-8b-instant"

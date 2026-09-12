@@ -82,6 +82,7 @@ def load_routing_plan(path: str) -> RoutingPlan:
             max_attempts_same_route=int(item["max_attempts_same_route"]),
             transient_backoff_s=float(item["transient_backoff_s"]),
             retry_after_safe_maximum_s=float(item["retry_after_safe_maximum_s"]),
+            provider_endpoints=tuple(item.get("provider_endpoints") or ()),
         ))
     if not routes:
         raise ValueError("routing_contract.routes must not be empty")

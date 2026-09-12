@@ -285,13 +285,15 @@ def get_last_routing_audits():
 
 def _phase3_available_credential_refs():
     refs = {"local_runtime"}
+    if os.environ.get("OPENROUTER_API_KEY"):
+        refs.add("openrouter_api_key")
     if os.environ.get("OMNIROUTE_API_KEY") or os.environ.get("HERMES_CUSTOM_127_0_0_1_20128_API_KEY"):
         refs.add("omniroute_api_key")
     return frozenset(refs)
 
 
 @contextlib.contextmanager
-def _phase3_no_fallback_profile(env):
+def _phase3_no_fallback_profile(env, route=None):
     """Mirror the active Hermes profile but remove its provider fallbacks.
 
     Hermes one-shot loads ``fallback_providers`` from its profile even when
@@ -313,6 +315,15 @@ def _phase3_no_fallback_profile(env):
         raise RuntimeError("Hermes routing profile config is invalid")
     config.pop("fallback_providers", None)
     config.pop("fallback_model", None)
+    if route is not None and route.provider == "openrouter":
+        endpoints = list(route.provider_endpoints)
+        if not endpoints:
+            raise RuntimeError("OpenRouter route requires a deterministic provider endpoint")
+        config["provider_routing"] = {
+            "only": endpoints,
+            "require_parameters": True,
+            "data_collection": "deny",
+        }
 
     with tempfile.TemporaryDirectory(prefix="fazle-phase3-hermes-") as temp_home_value:
         temp_home = Path(temp_home_value)
@@ -1192,27 +1203,26 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
         return None, f"Routing policy invalid: {type(exc).__name__}", None
 
     successful_process = None
-    routed_env = None
-
     def invoke(route, attempt_number):
         nonlocal successful_process
         provider = "ollama" if route.provider == "ollama-local" else route.provider
         cmd = list(base_cmd) + ["-m", route.model, "--provider", provider]
         if session_id:
             cmd += ["--resume", session_id]
-        invoke_env = routed_env
+        invoke_env = env
         if PHASE3_REGISTRY_ENABLED:
             from config.fazle_ai.registry_client import resolve_route_credential
             try:
                 invoke_env = resolve_route_credential(
                     PHASE3_REGISTRY_URL, PHASE3_REGISTRY_BEARER,
-                    request.workload, route, routed_env,
+                    request.workload, route, env,
                 )
             except Exception:
                 return ProviderResult.failure(FailureClass.AUTHENTICATION_FAILURE)
-        result, timed_out, crash_detail = _run_hermes_once(
-            cmd, invoke_env, TIMEOUT_SECONDS, session_id=session_id, persona=persona, cwd=cwd
-        )
+        with _phase3_no_fallback_profile(invoke_env, route) as routed_env:
+            result, timed_out, crash_detail = _run_hermes_once(
+                cmd, routed_env, TIMEOUT_SECONDS, session_id=session_id, persona=persona, cwd=cwd
+            )
         if timed_out:
             return ProviderResult.failure(FailureClass.TIMEOUT)
         if crash_detail is not None:
@@ -1230,16 +1240,15 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
         return ProviderResult.success((result.stdout or "").strip())
 
     try:
-        with _phase3_no_fallback_profile(env) as routed_env:
-            routed = RoutingEngine(
-                plan.routes,
-                environment=PHASE3_ROUTING_ENVIRONMENT,
-                available_credential_refs=(
-                    frozenset(route.credential_ref for route in plan.routes)
-                    if PHASE3_REGISTRY_ENABLED else _phase3_available_credential_refs()
-                ),
-                sleep=time.sleep,
-            ).execute(request, invoke)
+        routed = RoutingEngine(
+            plan.routes,
+            environment=PHASE3_ROUTING_ENVIRONMENT,
+            available_credential_refs=(
+                frozenset(route.credential_ref for route in plan.routes)
+                if PHASE3_REGISTRY_ENABLED else _phase3_available_credential_refs()
+            ),
+            sleep=time.sleep,
+        ).execute(request, invoke)
     except NoCompatibleRoute as exc:
         _LAST_ROUTING_AUDITS.set(())
         return None, f"No compatible route: {exc}", FailureClass.INVALID_REQUEST_OR_POLICY_REJECTION

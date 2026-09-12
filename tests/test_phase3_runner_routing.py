@@ -42,7 +42,7 @@ def test_failed_runtime_audit_keeps_only_redacted_bounded_diagnostic():
     failed = (_completed(stdout="", stderr="503 Bearer abcdefghijklmnopqrstuvwxyz", returncode=1), False, None)
     success = (_completed(stdout="ok"), False, None)
     with patch.object(server, "PHASE3_ROUTING_ENABLED", True), patch.object(
-        server, "_phase3_available_credential_refs", return_value=frozenset({"omniroute_api_key"})
+        server, "_phase3_available_credential_refs", return_value=frozenset({"openrouter_api_key"})
     ), patch.object(server, "_run_hermes_once", side_effect=[failed, failed, success]), patch.object(
         server.time, "sleep", return_value=None
     ):
@@ -70,7 +70,7 @@ def test_policy_enabled_timeout_then_fallback_keeps_one_toolset_and_final_reply(
     first = (None, True, None)
     second = (_completed(stdout="one final reply"), False, None)
     with patch.object(server, "PHASE3_ROUTING_ENABLED", True), patch.object(
-        server, "_phase3_available_credential_refs", return_value=frozenset({"omniroute_api_key"})
+        server, "_phase3_available_credential_refs", return_value=frozenset({"openrouter_api_key"})
     ), patch.object(server, "_run_hermes_once", side_effect=[first, first, second]) as invoke, patch.object(
         server.time, "sleep", return_value=None
     ):
@@ -85,7 +85,7 @@ def test_policy_enabled_timeout_then_fallback_keeps_one_toolset_and_final_reply(
 def test_policy_enabled_auth_failure_stops_without_fallback():
     failed = (_completed(stdout="", stderr="401 invalid API key", returncode=1), False, None)
     with patch.object(server, "PHASE3_ROUTING_ENABLED", True), patch.object(
-        server, "_phase3_available_credential_refs", return_value=frozenset({"omniroute_api_key"})
+        server, "_phase3_available_credential_refs", return_value=frozenset({"openrouter_api_key"})
     ), patch.object(server, "_run_hermes_once", return_value=failed) as invoke:
         reply, _, error, _ = server.run_hermes(None, "hello", "helpful", force_mode="READ")
     assert reply is None and "authentication_failure" in error
@@ -146,3 +146,35 @@ plugins: {enabled: [task_action_policy]}
         inspect_profile([], routed_env)
     assert seen and not seen[0].exists()
     assert (home / "config.yaml").read_text(encoding="utf-8") == source_config
+
+
+def test_openrouter_route_profile_pins_one_endpoint_and_denies_collection(tmp_path):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "model: {provider: openrouter, default: legacy}\n"
+        "fallback_providers: [{provider: other, model: hidden}]\n",
+        encoding="utf-8",
+    )
+    route = SimpleNamespace(
+        provider="openrouter", provider_endpoints=("open-inference/fp8",),
+    )
+    with server._phase3_no_fallback_profile({"HERMES_HOME": str(home)}, route) as routed_env:
+        import yaml
+        config = yaml.safe_load((Path(routed_env["HERMES_HOME"]) / "config.yaml").read_text())
+        assert "fallback_providers" not in config
+        assert config["provider_routing"] == {
+            "only": ["open-inference/fp8"],
+            "require_parameters": True,
+            "data_collection": "deny",
+        }
+
+
+def test_openrouter_route_without_endpoint_fails_closed(tmp_path):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    route = SimpleNamespace(provider="openrouter", provider_endpoints=())
+    with pytest.raises(RuntimeError, match="deterministic provider endpoint"):
+        with server._phase3_no_fallback_profile({"HERMES_HOME": str(home)}, route):
+            pass
