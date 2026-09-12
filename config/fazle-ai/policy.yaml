@@ -80,6 +80,8 @@ model_policy:
     - "*/cc/cc-*"                   # malformed cc/cc/... namespace entries seen in OmniRoute catalog
     - "*-low-thinking"              # truncated-experiment models with no upstream backing
   allow_models:
+    # ── OpenRouter (Owner Priority #1 candidate) ─────────────────────────
+    - "deepseek/deepseek-v4-flash-0731"
     # ── Anthropic via OmniRoute (Claude Code OAuth) ─────────────────────
     - "claude/claude-opus-4-6"
     - "claude/claude-sonnet-4-6"

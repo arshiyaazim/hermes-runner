@@ -211,8 +211,9 @@ def test_versioned_workload_policy_loads_request_defaults_and_explicit_routes():
     request = plan.new_request(correlation_ref="session:abc", context_version="ctx-v2")
     assert request.workload == "administrative_reasoning"
     assert Capability.STRUCTURED_OUTPUT in request.required_capabilities
-    assert plan.routes[0].route_id == "omniroute-opus"
-    assert plan.routes[0].transport is TransportKind.PRIVATE_GATEWAY
+    assert plan.routes[0].route_id == "openrouter-deepseek-v4-flash"
+    assert plan.routes[0].model == "deepseek/deepseek-v4-flash-0731"
+    assert plan.routes[0].transport is TransportKind.DIRECT_PROVIDER
     assert plan.routes[-1].transport is TransportKind.LOCAL
     assert all(route.credential_ref for route in plan.routes)
 

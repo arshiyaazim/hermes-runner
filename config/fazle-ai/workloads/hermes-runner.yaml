@@ -32,6 +32,7 @@ routing_contract:
   fallback_eligible: true
   retry_eligible: true
   routes:
+    - {route_id: openrouter-deepseek-v4-flash, provider: openrouter, model: deepseek/deepseek-v4-flash-0731, transport: direct_provider, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 131072, privacy_classes: [approved_external], credential_ref: openrouter_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 1, transient_backoff_s: 0, retry_after_safe_maximum_s: 30}
     - {route_id: omniroute-opus, provider: omniroute, model: claude/claude-opus-4-6, transport: private_gateway, capabilities: [text_generation, structured_output, long_context], cost_class: high, latency_classes: [interactive, background], max_context_tokens: 200000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
     - {route_id: omniroute-sonnet, provider: omniroute, model: claude/claude-sonnet-4-6, transport: private_gateway, capabilities: [text_generation, structured_output, long_context], cost_class: standard, latency_classes: [interactive, background], max_context_tokens: 200000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
     - {route_id: omniroute-gemini, provider: omniroute, model: gemini/gemini-3.1-flash-lite, transport: private_gateway, capabilities: [text_generation, structured_output, long_context], cost_class: low, latency_classes: [interactive, background, batch], max_context_tokens: 1000000, privacy_classes: [private_gateway, approved_external], credential_ref: omniroute_api_key, allowed_workloads: [administrative_reasoning], enabled: true, environments: [development, test, production], max_attempts_same_route: 2, transient_backoff_s: 2, retry_after_safe_maximum_s: 30}
@@ -43,6 +44,8 @@ routing_contract:
 # Each entry's model must match a value in the global policy allowlist.
 # Order is significant: this list doubles as the fallback chain.
 fallback_chain:
+  - provider: openrouter
+    model: deepseek/deepseek-v4-flash-0731
   - provider: omniroute
     model: claude/claude-opus-4-6
   - provider: omniroute
@@ -87,6 +90,7 @@ logging:
 # Secret refs (NO VALUES HERE — names only).
 # Resolver walks: runtime secrets.env -> (future) Vault -> (fallback) fail-closed with operator-visible error.
 secret_refs:
+  openrouter_api_key: "system-secret://openrouter_api_key"
   omniroute_api_key: "vault://fazle-ai/workloads/hermes-runner/omniroute-api-key"
   tavily_api_key: "vault://fazle-ai/workloads/hermes-runner/tavily-api-key"
   hermes_runner_secret: "vault://fazle-ai/workloads/hermes-runner/runner-secret"
