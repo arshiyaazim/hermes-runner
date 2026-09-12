@@ -209,7 +209,7 @@ def test_retry_disabled_advances_after_timeout_without_second_attempt():
 def test_versioned_workload_policy_loads_request_defaults_and_explicit_routes():
     plan = load_routing_plan("config/fazle-ai/workloads/hermes-runner.yaml")
     request = plan.new_request(correlation_ref="session:abc", context_version="ctx-v2")
-    assert request.workload == "administrative_analysis"
+    assert request.workload == "administrative_reasoning"
     assert Capability.STRUCTURED_OUTPUT in request.required_capabilities
     assert plan.routes[0].route_id == "omniroute-opus"
     assert plan.routes[0].transport is TransportKind.PRIVATE_GATEWAY

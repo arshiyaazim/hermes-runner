@@ -272,6 +272,9 @@ PHASE3_ROUTING_WORKLOAD_FILE = os.environ.get(
     os.path.join(os.path.dirname(__file__), "config/fazle-ai/workloads/hermes-runner.yaml"),
 )
 PHASE3_ROUTING_ENVIRONMENT = os.environ.get("FAZLE_AI_ENVIRONMENT", "production")
+PHASE3_REGISTRY_ENABLED = os.environ.get("HERMES_RUNNER_REGISTRY_ENABLED", "false").lower() == "true"
+PHASE3_REGISTRY_URL = os.environ.get("FAZLE_CORE_ROUTE_REGISTRY_URL", "http://127.0.0.1:8200")
+PHASE3_REGISTRY_BEARER = os.environ.get("FAZLE_CORE_ROUTE_REGISTRY_BEARER", "")
 _LAST_ROUTING_AUDITS = contextvars.ContextVar("hermes_runner_last_routing_audits", default=())
 
 
@@ -1172,6 +1175,14 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
 
     try:
         plan = load_routing_plan(PHASE3_ROUTING_WORKLOAD_FILE)
+        if PHASE3_REGISTRY_ENABLED:
+            if not PHASE3_REGISTRY_BEARER:
+                raise ValueError("route registry bearer is unavailable")
+            from config.fazle_ai.registry_client import load_registry_routes
+            plan = type(plan)(
+                request_defaults=plan.request_defaults,
+                routes=load_registry_routes(PHASE3_REGISTRY_URL, PHASE3_REGISTRY_BEARER, plan.request_defaults["workload"]),
+            )
         request = plan.new_request(
             correlation_ref=f"session:{session_id or 'new'}",
             context_version="runner-context-v1",
@@ -1189,8 +1200,18 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
         cmd = list(base_cmd) + ["-m", route.model, "--provider", provider]
         if session_id:
             cmd += ["--resume", session_id]
+        invoke_env = routed_env
+        if PHASE3_REGISTRY_ENABLED:
+            from config.fazle_ai.registry_client import resolve_route_credential
+            try:
+                invoke_env = resolve_route_credential(
+                    PHASE3_REGISTRY_URL, PHASE3_REGISTRY_BEARER,
+                    request.workload, route, routed_env,
+                )
+            except Exception:
+                return ProviderResult.failure(FailureClass.AUTHENTICATION_FAILURE)
         result, timed_out, crash_detail = _run_hermes_once(
-            cmd, routed_env, TIMEOUT_SECONDS, session_id=session_id, persona=persona, cwd=cwd
+            cmd, invoke_env, TIMEOUT_SECONDS, session_id=session_id, persona=persona, cwd=cwd
         )
         if timed_out:
             return ProviderResult.failure(FailureClass.TIMEOUT)
@@ -1213,7 +1234,10 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
             routed = RoutingEngine(
                 plan.routes,
                 environment=PHASE3_ROUTING_ENVIRONMENT,
-                available_credential_refs=_phase3_available_credential_refs(),
+                available_credential_refs=(
+                    frozenset(route.credential_ref for route in plan.routes)
+                    if PHASE3_REGISTRY_ENABLED else _phase3_available_credential_refs()
+                ),
                 sleep=time.sleep,
             ).execute(request, invoke)
     except NoCompatibleRoute as exc:
