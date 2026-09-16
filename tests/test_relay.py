@@ -863,3 +863,27 @@ class TestSchemaProbeFailureHaltObservability(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestEvidenceReferences(unittest.TestCase):
+    def test_bounded_identifier_only_metadata(self):
+        refs = server._bounded_evidence_references([{
+            "dataset": "payroll",
+            "record_count": 2,
+            "record_ids": ["id=17", "employee_id=4"],
+            "total": 2,
+            "raw_rows": [{"salary": 99999}],
+        }])
+        self.assertEqual(refs, [{
+            "dataset": "payroll",
+            "record_count": 2,
+            "record_ids": ["id=17", "employee_id=4"],
+            "total": 2,
+        }])
+
+    def test_invalid_or_oversized_metadata_is_bounded(self):
+        refs = server._bounded_evidence_references([
+            {"dataset": "x", "record_count": "bad", "record_ids": "bad", "total": None},
+            "invalid",
+        ] * 100)
+        self.assertEqual(len(refs), 25)
+        self.assertEqual(refs[0]["record_ids"], [])

@@ -1444,6 +1444,30 @@ def _handle_audit(body):
     return 200, result
 
 
+def _bounded_evidence_references(value):
+    """Keep caller-supplied evidence metadata bounded and identifier-only."""
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value[:50]:
+        if not isinstance(item, dict):
+            continue
+        record_ids = item.get("record_ids")
+        if not isinstance(record_ids, list):
+            record_ids = []
+        try:
+            record_count = int(item.get("record_count", 0) or 0)
+        except (TypeError, ValueError):
+            record_count = 0
+        result.append({
+            "dataset": str(item.get("dataset", ""))[:100],
+            "record_count": max(0, min(record_count, 1000000)),
+            "record_ids": [str(ref)[:120] for ref in record_ids[:100]],
+            "total": item.get("total"),
+        })
+    return result
+
+
 def _parse_run_request(body):
     """Validates + normalizes a /run request body. Returns
     (hermes_session_id, message, persona, force_mode, readonly_key,
@@ -1599,6 +1623,7 @@ class Handler(BaseHTTPRequestHandler):
             if not RUNNER_SECRET or auth != f"Bearer {RUNNER_SECRET}":
                 return self._send(401, {"error": "unauthorized"})
 
+        evidence_references = _bounded_evidence_references(body.get("evidence_references"))
         hermes_session_id, message, persona, force_mode, readonly_key, caller_scope, err = _parse_run_request(body)
         if err:
             return self._send(400, {"error": err})
@@ -1649,7 +1674,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if error:
             return self._send(502, {"error": error, "hermes_session_id": new_session_id, "mode": mode})
-        self._send(200, {"reply": reply, "hermes_session_id": new_session_id, "mode": mode})
+        self._send(200, {
+            "reply": reply,
+            "hermes_session_id": new_session_id,
+            "mode": mode,
+            "evidence_references": evidence_references,
+        })
 
     def log_message(self, fmt, *args):
         # Default BaseHTTPRequestHandler logs to stderr, which lands in
