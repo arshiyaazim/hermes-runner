@@ -156,6 +156,25 @@ def redact_sensitive_headers(headers):
     return redacted
 
 
+def apply_gateway_selection(env=None):
+    """Populate the subprocess environment with the selected gateway target.
+
+    This keeps the default Hermes path untouched unless an explicit gateway
+    target or endpoint override is configured, while making the selected base
+    URL visible to the actual downstream inference call. The resolver remains
+    conservative: it defaults to OmniRoute, rejects invalid recursive topologies,
+    and preserves any legacy provider/model overrides already in use.
+    """
+    env = os.environ if env is None else env
+    resolved = resolve_gateway_target(env)
+    applied = dict(env)
+    applied["HERMES_GATEWAY_TARGET"] = resolved["target"]
+    applied["HERMES_PREFERRED_GATEWAY"] = resolved["target"]
+    applied["OMNIROUTE_BASE_URL"] = resolved["gateways"]["omniroute"]
+    applied["NINE_ROUTER_BASE_URL"] = resolved["gateways"]["9router"]
+    return applied
+
+
 SESSION_ID_RE = re.compile(r"session_id:\s*(\S+)")
 
 RUNNER_SECRET = os.environ.get("HERMES_RUNNER_SECRET", "")
@@ -1428,6 +1447,11 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
 
     # See STALE_CALL_TIMEOUT_SECONDS' definition above for why this is set.
     env = {**os.environ, "HERMES_API_CALL_STALE_TIMEOUT": STALE_CALL_TIMEOUT_SECONDS}
+    # The real Hermes CLI call is the subprocess entrypoint below.  Ensure the
+    # selected gateway target is visible to that request path without changing
+    # the legacy default, and reject recursive topology before any inference is
+    # attempted.
+    env = apply_gateway_selection(env)
 
     # 2026-08-25, WS6 acceptance-test finding: only the WhatsApp Owner
     # relay gets a real repo cwd -- every other caller/mode keeps cwd=None
