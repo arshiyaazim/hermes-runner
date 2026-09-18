@@ -94,6 +94,68 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import audit_tools
 
+KNOWN_GATEWAY_BASE_URLS = {
+    "omniroute": "http://127.0.0.1:20128/v1",
+    "9router": "http://127.0.0.1:20129/v1",
+}
+
+
+def validate_gateway_topology(gateway_map):
+    """Reject recursive gateway chains such as OmniRoute -> 9Router -> OmniRoute."""
+    normalized = {}
+    for gateway_name, base_url in (gateway_map or {}).items():
+        if not base_url:
+            continue
+        normalized[gateway_name] = str(base_url).rstrip("/")
+
+    for gateway_name, base_url in normalized.items():
+        for other_name, other_url in normalized.items():
+            if gateway_name == other_name:
+                continue
+            if base_url == other_url:
+                raise ValueError(f"Gateway recursion detected: {gateway_name} and {other_name} both resolve to {base_url}")
+            if base_url in KNOWN_GATEWAY_BASE_URLS.values() and other_url in KNOWN_GATEWAY_BASE_URLS.values():
+                if base_url == KNOWN_GATEWAY_BASE_URLS.get(other_name) or other_url == KNOWN_GATEWAY_BASE_URLS.get(gateway_name):
+                    raise ValueError(f"Recursive router loop detected between {gateway_name} and {other_name}")
+    return normalized
+
+
+def resolve_gateway_target(env=None):
+    env = os.environ if env is None else env
+    preferred = (env.get("HERMES_GATEWAY_TARGET") or env.get("HERMES_PREFERRED_GATEWAY") or "auto").lower()
+    gateways = {
+        "omniroute": (env.get("OMNIROUTE_BASE_URL") or KNOWN_GATEWAY_BASE_URLS["omniroute"]).rstrip("/"),
+        "9router": (env.get("NINE_ROUTER_BASE_URL") or KNOWN_GATEWAY_BASE_URLS["9router"]).rstrip("/"),
+    }
+    validate_gateway_topology(gateways)
+
+    selected = preferred
+    if preferred in ("", "auto"):
+        selected = "omniroute"
+    elif preferred not in gateways:
+        raise ValueError(f"Unsupported Hermes gateway target: {preferred}")
+
+    if selected == "omniroute":
+        return {"target": "omniroute", "base_url": gateways["omniroute"], "gateways": gateways}
+    if selected == "9router":
+        return {"target": "9router", "base_url": gateways["9router"], "gateways": gateways}
+    raise ValueError(f"Unsupported Hermes gateway target: {preferred}")
+
+
+def redact_sensitive_headers(headers):
+    redacted = {}
+    for key, value in (headers or {}).items():
+        lowered = str(key).lower()
+        if any(token in lowered for token in ("authorization", "api-key", "token", "secret", "password", "cookie")):
+            if lowered == "authorization" and isinstance(value, str) and value.lower().startswith("bearer "):
+                redacted[key] = "Bearer [REDACTED]"
+            else:
+                redacted[key] = "[REDACTED]"
+        else:
+            redacted[key] = value
+    return redacted
+
+
 SESSION_ID_RE = re.compile(r"session_id:\s*(\S+)")
 
 RUNNER_SECRET = os.environ.get("HERMES_RUNNER_SECRET", "")
