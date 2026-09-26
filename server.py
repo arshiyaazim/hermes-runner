@@ -78,8 +78,10 @@ hermes-runner restart, only its own on-disk Hermes session does (a fresh
 caller falls back to starting a new conversation, not an error state).
 """
 
+import base64
 import contextvars
 import contextlib
+from dataclasses import replace
 import datetime
 import json
 import os
@@ -90,6 +92,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import audit_tools
@@ -356,12 +360,121 @@ PHASE3_ROUTING_ENVIRONMENT = os.environ.get("FAZLE_AI_ENVIRONMENT", "production"
 PHASE3_REGISTRY_ENABLED = os.environ.get("HERMES_RUNNER_REGISTRY_ENABLED", "false").lower() == "true"
 PHASE3_REGISTRY_URL = os.environ.get("FAZLE_CORE_ROUTE_REGISTRY_URL", "http://127.0.0.1:8200")
 PHASE3_REGISTRY_BEARER = os.environ.get("FAZLE_CORE_ROUTE_REGISTRY_BEARER", "")
+HERMES_PROVIDER_CONFIG_URL = os.environ.get(
+    "HERMES_PROVIDER_CONFIG_URL",
+    "http://127.0.0.1:3001/api/hermes/customer-provider/resolve",
+)
+TRUSTED_CUSTOMER_WORKLOAD_ID = "fazle-core.customer"
+
+def _trusted_workload_request(caller_scope, workload_id):
+    if caller_scope == "customer":
+        return workload_id == TRUSTED_CUSTOMER_WORKLOAD_ID
+    return workload_id is None
+
 _LAST_ROUTING_AUDITS = contextvars.ContextVar("hermes_runner_last_routing_audits", default=())
 
 
 def get_last_routing_audits():
     """Safe attempt metadata for the current request context."""
     return list(_LAST_ROUTING_AUDITS.get())
+
+
+def _decrypt_runner_credential(encoded):
+    """Decrypt the backend's short-lived AES-GCM envelope in memory only."""
+    if not encoded or not RUNNER_SECRET:
+        return ""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        raw = base64.b64decode(encoded, validate=True)
+        if len(raw) < 28:
+            return ""
+        key = __import__("hashlib").sha256(RUNNER_SECRET.encode()).digest()
+        return AESGCM(key).decrypt(raw[:12], raw[28:], raw[12:28]).decode()
+    except Exception:
+        return ""
+
+
+def _load_customer_provider_config(workload_id=None):
+    """Read the selected provider through the existing backend trust channel.
+
+    A missing/unavailable settings record is intentionally different from a
+    configured record: only the former permits the legacy Phase-3 plan. A
+    configured record that cannot be resolved fails closed rather than silently
+    selecting stale environment configuration.
+    """
+    if not HERMES_PROVIDER_CONFIG_URL or not RUNNER_SECRET:
+        return None
+    body = b""
+    headers = {"Authorization": f"Bearer {RUNNER_SECRET}"}
+    if workload_id:
+        body = json.dumps({"workload_id": workload_id}).encode("utf-8")
+        headers.update({"Content-Type": "application/json", "Content-Length": str(len(body))})
+    else:
+        headers["Content-Length"] = "0"
+    request = urllib.request.Request(HERMES_PROVIDER_CONFIG_URL, method="POST", headers=headers, data=body or None)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("configured"):
+        return None
+    def with_credential(item):
+        return {**item, "api_key": _decrypt_runner_credential(item.get("credential_envelope"))}
+    candidates = [with_credential(item) for item in payload.get("candidates", []) if isinstance(item, dict)]
+    result = with_credential(payload)
+    if candidates:
+        result["candidates"] = candidates
+    return result
+
+
+def _resolve_customer_model(provider_config):
+    model = str(provider_config.get("model") or "").strip()
+    if model:
+        return model
+    provider = str(provider_config.get("provider") or "").lower()
+    base_url = str(provider_config.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return ""
+    headers = {}
+    if provider_config.get("api_key"):
+        headers["Authorization"] = f"Bearer {provider_config['api_key']}"
+    try:
+        request = urllib.request.Request(f"{base_url}/models", headers=headers)
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        ids = [item.get("id") for item in (body.get("data") or []) if isinstance(item, dict) and item.get("id")]
+    except (OSError, ValueError, urllib.error.URLError):
+        return ""
+    if provider == "9router" and "auto" in ids:
+        return "auto"
+    if provider == "ollama" and "hermes3:3b" in ids:
+        return "hermes3:3b"
+    return ""
+
+
+def _customer_routing_plan(plan, provider_config, workload_id=None):
+    if not provider_config:
+        return plan
+    base_route = plan.routes[0]
+    candidates = provider_config.get("candidates") or [provider_config]
+    routes = []
+    for index, candidate in enumerate(candidates):
+        if not candidate.get("api_key") and str(candidate.get("provider") or "").lower() not in {"ollama", "ollama-local"}:
+            raise ValueError("selected customer provider credential is unavailable")
+        model = _resolve_customer_model(candidate)
+        if not model:
+            raise ValueError("selected customer provider model/route could not be resolved")
+        suffix = candidate.get("config_id") or ("selected" if index == 0 else str(index))
+        routes.append(replace(
+            base_route, route_id=f"hermes-customer-{suffix}", provider="custom:fazle-customer",
+            model=model, credential_ref="local_runtime", provider_endpoints=(),
+            allowed_workloads=frozenset({plan.request_defaults["workload"]}),
+        ))
+    # A workload-scoped resolver may only return its own candidates. Legacy
+    # id=TRUE callers retain the prior plan for compatibility.
+    fallback = () if workload_id else plan.routes
+    return type(plan)(request_defaults=plan.request_defaults, routes=(*routes, *fallback))
 
 
 def _phase3_available_credential_refs():
@@ -374,15 +487,15 @@ def _phase3_available_credential_refs():
 
 
 @contextlib.contextmanager
-def _phase3_no_fallback_profile(env, route=None):
-    """Mirror the active Hermes profile but remove its provider fallbacks.
+def _phase3_no_fallback_profile(env, route=None, provider_config=None):
+    """Build an ephemeral Hermes profile without stale endpoint overrides.
 
-    Hermes one-shot loads ``fallback_providers`` from its profile even when
-    ``-m`` and ``--provider`` are explicit.  The Phase 3 executor must be the
-    sole retry/fallback owner, so routed invocations receive an ephemeral
-    profile whose config preserves tool/MCP/security settings but contains no
-    fallback chain.  Existing state (sessions, credentials, plugin state) is
-    linked, not copied, and the source profile is never modified.
+    Hermes requires the profile's provider metadata even when ``-m`` and
+    ``--provider`` are explicit. Legacy fallback metadata is therefore kept
+    intact; for a settings-managed customer route it is narrowed to the
+    selected provider so the existing routing engine remains the only owner of
+    cross-provider fallback. Existing state and credentials are linked, not
+    copied, and the source profile is never modified.
     """
     import yaml
 
@@ -394,17 +507,27 @@ def _phase3_no_fallback_profile(env, route=None):
         config = yaml.safe_load(handle) or {}
     if not isinstance(config, dict):
         raise RuntimeError("Hermes routing profile config is invalid")
-    config.pop("fallback_providers", None)
     config.pop("fallback_model", None)
-    if route is not None and route.provider == "openrouter":
-        endpoints = list(route.provider_endpoints)
-        if not endpoints:
-            raise RuntimeError("OpenRouter route requires a deterministic provider endpoint")
-        config["provider_routing"] = {
-            "only": endpoints,
-            "require_parameters": True,
-            "data_collection": "deny",
+    # Route metadata is audit policy, not a second provider-authentication
+    # source. The old injection of provider_routing forced a stale OpenRouter
+    # account and caused HTTP 401 even though the same key/model worked on the
+    # normal OpenAI-compatible endpoint.
+    config.pop("provider_routing", None)
+    if provider_config:
+        selected_model = str(getattr(route, "model", "") or provider_config.get("model") or "").strip()
+        if not selected_model:
+            raise RuntimeError("selected customer provider model is unavailable")
+        providers = config.setdefault("providers", {})
+        providers["fazle-customer"] = {
+            "name": "fazle-customer",
+            "base_url": str(provider_config["base_url"]).rstrip("/"),
+            "discover_models": False,
+            "key_env": "FAZLE_CUSTOMER_API_KEY",
+            "models": {selected_model: {}},
         }
+        config["fallback_providers"] = [{
+            "provider": "fazle-customer", "model": selected_model,
+        }]
 
     with tempfile.TemporaryDirectory(prefix="fazle-phase3-hermes-") as temp_home_value:
         temp_home = Path(temp_home_value)
@@ -1254,7 +1377,7 @@ def _record_schema_probe_halts(stderr_text: str, session_id) -> None:
         })
 
 
-def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
+def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd, caller_scope=None, workload_id=None):
     """Run one policy-owned inference lifecycle; never performs delivery."""
     from config.fazle_ai.failure_classifier import (
         classify_provider_failure,
@@ -1267,7 +1390,21 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
 
     try:
         plan = load_routing_plan(PHASE3_ROUTING_WORKLOAD_FILE)
-        if PHASE3_REGISTRY_ENABLED:
+        customer_provider = _load_customer_provider_config(workload_id) if caller_scope == "customer" else None
+        customer_provider_by_route_id = {}
+        if customer_provider:
+            for index, candidate in enumerate(customer_provider.get("candidates") or [customer_provider]):
+                suffix = candidate.get("config_id") or ("selected" if index == 0 else str(index))
+                customer_provider_by_route_id[f"hermes-customer-{suffix}"] = candidate
+        if caller_scope == "customer" and workload_id and customer_provider is None:
+            _LAST_ROUTING_AUDITS.set(())
+            return None, "No workload-scoped customer provider configured", FailureClass.INVALID_REQUEST_OR_POLICY_REJECTION
+
+        if customer_provider is not None:
+            plan = _customer_routing_plan(plan, customer_provider, workload_id=workload_id)
+        # A saved customer provider is authoritative; registry routing remains
+        # the legacy source only when no settings entry exists.
+        if PHASE3_REGISTRY_ENABLED and customer_provider is None:
             if not PHASE3_REGISTRY_BEARER:
                 raise ValueError("route registry bearer is unavailable")
             from config.fazle_ai.registry_client import load_registry_routes
@@ -1291,7 +1428,7 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
         if session_id:
             cmd += ["--resume", session_id]
         invoke_env = env
-        if PHASE3_REGISTRY_ENABLED:
+        if PHASE3_REGISTRY_ENABLED and customer_provider is None:
             from config.fazle_ai.registry_client import resolve_route_credential
             try:
                 invoke_env = resolve_route_credential(
@@ -1300,7 +1437,12 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
                 )
             except Exception:
                 return ProviderResult.failure(FailureClass.AUTHENTICATION_FAILURE)
-        with _phase3_no_fallback_profile(invoke_env, route) as routed_env:
+        route_provider_config = customer_provider_by_route_id.get(route.route_id)
+        if route_provider_config:
+            invoke_env = dict(invoke_env)
+            if route_provider_config.get("api_key"):
+                invoke_env["FAZLE_CUSTOMER_API_KEY"] = route_provider_config["api_key"]
+        with _phase3_no_fallback_profile(invoke_env, route, route_provider_config) as routed_env:
             result, timed_out, crash_detail = _run_hermes_once(
                 cmd, routed_env, TIMEOUT_SECONDS, session_id=session_id, persona=persona, cwd=cwd
             )
@@ -1348,7 +1490,7 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd):
     return successful_process, None, None
 
 
-def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None, readonly_key=None):
+def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None, readonly_key=None, workload_id=None):
     """force_mode (Phase 4, 2026-08-04): when set, use that mode's toolset
     for THIS call only — does not read or write the persisted mode file, so
     it can never affect (or be affected by) the web UI's own current mode.
@@ -1465,7 +1607,8 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
 
     if PHASE3_ROUTING_ENABLED:
         result, routing_error, _failure_class = _run_with_phase3_routing(
-            cmd, env, session_id=hermes_session_id, persona=persona, cwd=cwd
+            cmd, env, session_id=hermes_session_id, persona=persona, cwd=cwd,
+            caller_scope=caller_scope, workload_id=workload_id,
         )
         if routing_error is not None:
             return None, None, routing_error, mode
@@ -1686,12 +1829,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path != "/run":
             return self._send(404, {"error": "not found"})
-
         length = int(self.headers.get("Content-Length", "0"))
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
         except json.JSONDecodeError:
             return self._send(400, {"error": "invalid JSON body"})
+        workload_id = body.get("workload_id")
+        if not _trusted_workload_request((body.get("caller_scope") or "").strip(), workload_id):
+            return self._send(400, {"error": "workload_id is only valid for customer calls"})
 
         # Phase 1 customer path (2026-08-12): which bearer secret is valid
         # depends on the request's own declared caller_scope, so the body
@@ -1721,7 +1866,7 @@ class Handler(BaseHTTPRequestHandler):
         _log(f"/run request received session={hermes_session_id or 'new'} persona={persona or '?'}")
         _append_diag({
             "event": "request_received", "session": hermes_session_id or "new",
-            "force_mode": force_mode, "readonly_key": readonly_key, "caller_scope": caller_scope,
+            "force_mode": force_mode, "readonly_key": readonly_key, "caller_scope": caller_scope, "workload_id": workload_id,
         })
         req_started = time.monotonic()
 
@@ -1734,7 +1879,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             reply, new_session_id, error, mode = run_hermes(
                 hermes_session_id, message, persona, force_mode=force_mode, caller_scope=caller_scope,
-                readonly_key=readonly_key,
+                readonly_key=readonly_key, workload_id=workload_id,
             )
         finally:
             lock.release()

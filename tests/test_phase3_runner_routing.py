@@ -1,8 +1,9 @@
 """Offline runtime wiring tests for hermes-runner Phase 3B."""
 from __future__ import annotations
 
+from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 import pytest
@@ -112,7 +113,7 @@ def test_policy_enabled_invalid_policy_fails_closed_before_subprocess(tmp_path):
     invoke.assert_not_called()
 
 
-def test_policy_enabled_uses_ephemeral_no_fallback_profile_without_mutating_source(tmp_path):
+def test_policy_enabled_uses_ephemeral_profile_without_stale_override_or_source_mutation(tmp_path):
     home = tmp_path / "hermes-home"
     home.mkdir()
     source_config = """\
@@ -132,7 +133,7 @@ plugins: {enabled: [task_action_policy]}
         routed_home = Path(env["HERMES_HOME"])
         assert routed_home != home
         config = (routed_home / "config.yaml").read_text(encoding="utf-8")
-        assert "fallback_providers" not in config
+        assert "fallback_providers" in config
         assert "fallback_model" not in config
         assert "task_action_policy" in config
         assert "fazle-core" in config
@@ -148,7 +149,7 @@ plugins: {enabled: [task_action_policy]}
     assert (home / "config.yaml").read_text(encoding="utf-8") == source_config
 
 
-def test_openrouter_route_profile_pins_one_endpoint_and_denies_collection(tmp_path):
+def test_openrouter_route_profile_does_not_inject_stale_provider_override(tmp_path):
     home = tmp_path / "hermes-home"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -162,19 +163,88 @@ def test_openrouter_route_profile_pins_one_endpoint_and_denies_collection(tmp_pa
     with server._phase3_no_fallback_profile({"HERMES_HOME": str(home)}, route) as routed_env:
         import yaml
         config = yaml.safe_load((Path(routed_env["HERMES_HOME"]) / "config.yaml").read_text())
-        assert "fallback_providers" not in config
-        assert config["provider_routing"] == {
-            "only": ["open-inference/fp8"],
-            "require_parameters": True,
-            "data_collection": "deny",
-        }
+        assert "fallback_providers" in config
+        assert "provider_routing" not in config
 
 
-def test_openrouter_route_without_endpoint_fails_closed(tmp_path):
+def test_openrouter_route_without_endpoint_keeps_normal_provider_defaults(tmp_path):
     home = tmp_path / "hermes-home"
     home.mkdir()
     (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
     route = SimpleNamespace(provider="openrouter", provider_endpoints=())
-    with pytest.raises(RuntimeError, match="deterministic provider endpoint"):
-        with server._phase3_no_fallback_profile({"HERMES_HOME": str(home)}, route):
-            pass
+    with server._phase3_no_fallback_profile({"HERMES_HOME": str(home)}, route) as routed_env:
+        import yaml
+        config = yaml.safe_load((Path(routed_env["HERMES_HOME"]) / "config.yaml").read_text())
+        assert "provider_routing" not in config
+
+
+def test_selected_customer_provider_gets_an_ephemeral_named_profile(tmp_path):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("providers: {omniroute: {base_url: http://stale/v1}}\n", encoding="utf-8")
+    route_config = {
+        "provider": "9router", "base_url": "http://127.0.0.1:20129/v1",
+        "model": "general", "api_key": "runtime-secret", "credential_ref": "ref",
+    }
+    with server._phase3_no_fallback_profile({"HERMES_HOME": str(home)}, provider_config=route_config) as env:
+        import yaml
+        config = yaml.safe_load((Path(env["HERMES_HOME"]) / "config.yaml").read_text())
+        assert config["providers"]["fazle-customer"]["base_url"] == route_config["base_url"]
+        assert config["providers"]["fazle-customer"]["models"] == {"general": {}}
+        assert "provider_routing" not in config
+
+
+def test_customer_modelless_resolution_only_uses_advertised_supported_route():
+    from config.fazle_ai.route_loader import load_routing_plan
+    plan = load_routing_plan(server.PHASE3_ROUTING_WORKLOAD_FILE)
+    with patch.object(server, "_resolve_customer_model", return_value="auto"):
+        selected = server._customer_routing_plan(
+            plan,
+            {"provider": "9router", "api_key": "key", "model": "", "base_url": "http://router/v1"},
+        ).routes[0]
+    assert selected.model == "auto"
+    assert selected.provider == "custom:fazle-customer"
+
+
+def test_customer_workload_routes_are_deterministic_and_exclude_admin_fallbacks():
+    from config.fazle_ai.route_loader import load_routing_plan
+    plan = load_routing_plan(server.PHASE3_ROUTING_WORKLOAD_FILE)
+    candidates = {
+        "candidates": [
+            {"config_id": 9, "provider": "openrouter", "api_key": "key-a", "model": "model-a", "base_url": "https://a.test/v1"},
+            {"config_id": 12, "provider": "9router", "api_key": "key-b", "model": "general", "base_url": "https://b.test/v1"},
+        ]
+    }
+    scoped = server._customer_routing_plan(plan, candidates, workload_id=server.TRUSTED_CUSTOMER_WORKLOAD_ID)
+    assert [route.route_id for route in scoped.routes] == ["hermes-customer-9", "hermes-customer-12"]
+    assert all(route.provider == "custom:fazle-customer" for route in scoped.routes)
+
+
+def test_untrusted_customer_workload_is_rejected():
+    assert server._trusted_workload_request("customer", server.TRUSTED_CUSTOMER_WORKLOAD_ID)
+    assert not server._trusted_workload_request("customer", "assistant-platform")
+    assert not server._trusted_workload_request("customer", None)
+    assert server._trusted_workload_request(None, None)
+    assert not server._trusted_workload_request(None, server.TRUSTED_CUSTOMER_WORKLOAD_ID)
+
+
+def test_workload_scoped_missing_provider_does_not_use_legacy_plan():
+    with patch.object(server, "PHASE3_ROUTING_ENABLED", True), patch.object(
+        server, "_load_customer_provider_config", return_value=None
+    ), patch.object(server, "_run_hermes_once") as invoke:
+        reply, _, error, _ = server.run_hermes(None, "hello", "helpful", force_mode="CUSTOMER", caller_scope="customer", workload_id=server.TRUSTED_CUSTOMER_WORKLOAD_ID)
+    assert reply is None and "workload-scoped" in error
+    invoke.assert_not_called()
+
+
+def test_run_handler_parses_json_before_validating_workload_id():
+    body = b'{"caller_scope":"customer","workload_id":"assistant-platform"}'
+    handler = object.__new__(server.Handler)
+    handler.path = "/run"
+    handler.headers = {"Content-Length": str(len(body))}
+    handler.rfile = BytesIO(body)
+    handler._send = Mock()
+
+    handler.do_POST()
+
+    handler._send.assert_called_once_with(400, {"error": "workload_id is only valid for customer calls"})
