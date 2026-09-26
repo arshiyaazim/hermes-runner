@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from pathlib import Path
@@ -219,6 +220,53 @@ def test_customer_workload_routes_are_deterministic_and_exclude_admin_fallbacks(
     assert [route.route_id for route in scoped.routes] == ["hermes-customer-9", "hermes-customer-12"]
     assert all(route.provider == "custom:fazle-customer" for route in scoped.routes)
 
+def test_customer_workload_expands_saved_models_in_order():
+    from config.fazle_ai.route_loader import load_routing_plan
+    plan = load_routing_plan(server.PHASE3_ROUTING_WORKLOAD_FILE)
+    scoped = server._customer_routing_plan(
+        plan,
+        {
+            "config_id": 9,
+            "provider": "openrouter",
+            "api_key": "key-a",
+            "model": "model-b",
+            "models": ["model-a", "model-b", "model-c", "model-c"],
+            "base_url": "https://a.test/v1",
+        },
+        workload_id=server.TRUSTED_CUSTOMER_WORKLOAD_ID,
+    )
+    assert [route.model for route in scoped.routes[:3]] == ["model-b", "model-a", "model-c"]
+    assert [route.route_id for route in scoped.routes[:3]] == [
+        "hermes-customer-9-model-0",
+        "hermes-customer-9-model-1",
+        "hermes-customer-9-model-2",
+
+    ]
+    assert {route.provider_group for route in scoped.routes[:3]} == {"hermes-customer:9"}
+
+def test_customer_runtime_attempts_saved_models_in_order():
+    provider = {
+        "candidates": [{
+            "config_id": 9,
+            "provider": "openrouter",
+            "api_key": "key-a",
+            "model": "model-b",
+            "models": ["model-a", "model-b"],
+            "base_url": "https://a.test/v1",
+        }],
+    }
+    failed = (_completed(stdout="", stderr="404 model_not_found", returncode=1), False, None)
+    success = (_completed(stdout="policy-safe reply"), False, None)
+    with patch.object(server, "_load_customer_provider_config", return_value=provider), patch.object(
+        server, "_phase3_no_fallback_profile", return_value=nullcontext({"HERMES_HOME": "/tmp/hermes-test"}),
+    ), patch.object(server, "_run_hermes_once", side_effect=[failed, success]) as invoke:
+        process, error, failure = server._run_with_phase3_routing(
+            ["hermes"], {}, session_id=None, persona="helpful", cwd="/tmp",
+            caller_scope="customer", workload_id=server.TRUSTED_CUSTOMER_WORKLOAD_ID,
+        )
+    assert process.stdout == "policy-safe reply"
+    assert error is None and failure is None
+    assert [call.args[0][call.args[0].index("-m") + 1] for call in invoke.call_args_list] == ["model-b", "model-a"]
 
 def test_untrusted_customer_workload_is_rejected():
     assert server._trusted_workload_request("customer", server.TRUSTED_CUSTOMER_WORKLOAD_ID)

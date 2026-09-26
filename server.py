@@ -452,6 +452,23 @@ def _resolve_customer_model(provider_config):
         return "hermes3:3b"
     return ""
 
+def _customer_models(provider_config):
+    """Return the saved model order with the preferred model first."""
+    configured = provider_config.get("models")
+    if isinstance(configured, str):
+        configured = configured.split(",")
+    saved = []
+    for value in configured if isinstance(configured, (list, tuple)) else ():
+        model = str(value or "").strip()
+        if model and model not in saved:
+            saved.append(model)
+    preferred = str(provider_config.get("model") or "").strip()
+    ordered = ([preferred] if preferred else []) + [model for model in saved if model != preferred]
+    if ordered:
+        return ordered
+    resolved = _resolve_customer_model(provider_config)
+    return [resolved] if resolved else []
+
 
 def _customer_routing_plan(plan, provider_config, workload_id=None):
     if not provider_config:
@@ -462,15 +479,21 @@ def _customer_routing_plan(plan, provider_config, workload_id=None):
     for index, candidate in enumerate(candidates):
         if not candidate.get("api_key") and str(candidate.get("provider") or "").lower() not in {"ollama", "ollama-local"}:
             raise ValueError("selected customer provider credential is unavailable")
-        model = _resolve_customer_model(candidate)
-        if not model:
+        models = _customer_models(candidate)
+        if not models:
             raise ValueError("selected customer provider model/route could not be resolved")
         suffix = candidate.get("config_id") or ("selected" if index == 0 else str(index))
-        routes.append(replace(
-            base_route, route_id=f"hermes-customer-{suffix}", provider="custom:fazle-customer",
-            model=model, credential_ref="local_runtime", provider_endpoints=(),
-            allowed_workloads=frozenset({plan.request_defaults["workload"]}),
-        ))
+        group = f"hermes-customer:{suffix}"
+        for model_index, model in enumerate(models):
+            route_id = f"hermes-customer-{suffix}"
+            if len(models) > 1:
+                route_id = f"{route_id}-model-{model_index}"
+            routes.append(replace(
+                base_route, route_id=route_id, provider="custom:fazle-customer",
+                model=model, credential_ref="local_runtime", provider_endpoints=(),
+                provider_group=group,
+                allowed_workloads=frozenset({plan.request_defaults["workload"]}),
+            ))
     # A workload-scoped resolver may only return its own candidates. Legacy
     # id=TRUE callers retain the prior plan for compatibility.
     fallback = () if workload_id else plan.routes
@@ -1392,16 +1415,18 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd, caller_
         plan = load_routing_plan(PHASE3_ROUTING_WORKLOAD_FILE)
         customer_provider = _load_customer_provider_config(workload_id) if caller_scope == "customer" else None
         customer_provider_by_route_id = {}
-        if customer_provider:
-            for index, candidate in enumerate(customer_provider.get("candidates") or [customer_provider]):
-                suffix = candidate.get("config_id") or ("selected" if index == 0 else str(index))
-                customer_provider_by_route_id[f"hermes-customer-{suffix}"] = candidate
         if caller_scope == "customer" and workload_id and customer_provider is None:
             _LAST_ROUTING_AUDITS.set(())
             return None, "No workload-scoped customer provider configured", FailureClass.INVALID_REQUEST_OR_POLICY_REJECTION
 
         if customer_provider is not None:
             plan = _customer_routing_plan(plan, customer_provider, workload_id=workload_id)
+            for index, candidate in enumerate(customer_provider.get("candidates") or [customer_provider]):
+                suffix = candidate.get("config_id") or ("selected" if index == 0 else str(index))
+                prefix = f"hermes-customer-{suffix}"
+                for route in plan.routes:
+                    if route.route_id == prefix or route.route_id.startswith(f"{prefix}-model-"):
+                        customer_provider_by_route_id[route.route_id] = candidate
         # A saved customer provider is authoritative; registry routing remains
         # the legacy source only when no settings entry exists.
         if PHASE3_REGISTRY_ENABLED and customer_provider is None:

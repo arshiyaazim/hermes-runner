@@ -153,10 +153,13 @@ class RouteCandidate:
     transient_backoff_s: float = 2.0
     retry_after_safe_maximum_s: float = 30.0
     provider_endpoints: tuple[str, ...] = ()
+    provider_group: str | None = None
 
     def __post_init__(self) -> None:
         _validate_identifier(self.route_id, "route_id")
         _validate_identifier(self.provider, "provider")
+        if self.provider_group is not None:
+            _validate_identifier(self.provider_group, "provider_group")
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("model must not be empty")
         if not self.capabilities:

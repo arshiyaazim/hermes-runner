@@ -81,6 +81,19 @@ def test_permanent_capacity_failure_advances_without_retry(failure):
     assert result.content == "fallback"
     assert call.calls == [("preferred", 1), ("fallback", 1)]
 
+def test_quota_failure_skips_remaining_models_for_same_provider_group():
+    call = ScriptedCall({
+        "model-a": [_failed(FailureClass.QUOTA_EXHAUSTED)],
+        "provider-2": [ProviderResult.success("fallback")],
+    })
+    result = RoutingEngine((
+        _route("model-a", provider_group="provider-config-1"),
+        _route("model-b", provider_group="provider-config-1"),
+        _route("provider-2"),
+    )).execute(_request(), call)
+    assert result.content == "fallback"
+    assert call.calls == [("model-a", 1), ("provider-2", 1)]
+
 
 def test_timeout_retries_once_then_advances():
     call = ScriptedCall({

@@ -109,8 +109,11 @@ class RoutingEngine:
         )
         audits: list[dict[str, object]] = []
         last_failure = FailureClass.UNKNOWN
+        blocked_provider_groups: set[str] = set()
 
         for fallback_number, route in enumerate(routes):
+            if route.provider_group and route.provider_group in blocked_provider_groups:
+                continue
             attempt_number = 0
             while True:
                 attempt_number += 1
@@ -150,6 +153,8 @@ class RoutingEngine:
                         f"routing stopped on {last_failure.value}",
                         failure_class=last_failure, attempt_audits=audits,
                     )
+                if last_failure is FailureClass.QUOTA_CREDIT_EXHAUSTED and route.provider_group:
+                    blocked_provider_groups.add(route.provider_group)
                 if action is FailureAction.RETRY_THEN_NEXT and attempt_number < route.max_attempts_same_route:
                     backoff = route.transient_backoff_s
                     if backoff:
