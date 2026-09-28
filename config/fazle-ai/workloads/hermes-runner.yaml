@@ -80,7 +80,7 @@ logging:
 # Secret refs (NO VALUES HERE — names only).
 # Resolver walks: runtime secrets.env -> (future) Vault -> (fallback) fail-closed with operator-visible error.
 secret_refs:
-  openrouter_api_key: "system-secret://openrouter_api_key"
+  openrouter_api_key: "env://OPENROUTER_API_KEY"
   omniroute_api_key: "vault://fazle-ai/workloads/hermes-runner/omniroute-api-key"
   tavily_api_key: "vault://fazle-ai/workloads/hermes-runner/tavily-api-key"
   hermes_runner_secret: "vault://fazle-ai/workloads/hermes-runner/runner-secret"
