@@ -224,11 +224,27 @@ def test_versioned_workload_policy_loads_request_defaults_and_explicit_routes():
     request = plan.new_request(correlation_ref="session:abc", context_version="ctx-v2")
     assert request.workload == "administrative_reasoning"
     assert Capability.STRUCTURED_OUTPUT in request.required_capabilities
-    assert plan.routes[0].route_id == "openrouter-deepseek-v4-flash"
-    assert plan.routes[0].model == "deepseek/deepseek-v4-flash-0731"
+    assert plan.routes[0].route_id == "omniroute-gemini-3.1-flash-lite"
+    assert plan.routes[0].model == "gemini/gemini-3.1-flash-lite"
     assert plan.routes[0].transport is TransportKind.DIRECT_PROVIDER
     assert plan.routes[-1].transport is TransportKind.LOCAL
     assert all(route.credential_ref for route in plan.routes)
+
+
+def test_free_omniroute_route_is_primary_and_paid_openrouter_is_fallback_only():
+    plan = load_routing_plan("config/fazle-ai/workloads/hermes-runner.yaml")
+    primary = plan.routes[0]
+    assert primary.provider == "omniroute"
+    assert primary.credential_ref == "omniroute_api_key"
+    assert primary.cost_class is CostClass.LOW
+    assert all(
+        route.provider == "openrouter"
+        for route in plan.routes
+        if route.route_id != primary.route_id and route.enabled
+    )
+    # The paid route must remain reachable, but only strictly after the free one.
+    paid = [i for i, route in enumerate(plan.routes) if route.provider == "openrouter"]
+    assert paid and min(paid) > 0
 
 
 def test_every_policy_route_declares_compatibility_and_retry_ownership():

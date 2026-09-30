@@ -1483,7 +1483,18 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd, caller_
                 safe_detail=safe_diagnostic(diagnostic),
             )
         if not (result.stdout or "").strip():
-            return ProviderResult.failure(FailureClass.MALFORMED_PROVIDER_RESPONSE)
+            # 2026-09-30: the hermes CLI exits 0 and writes NOTHING to stdout
+            # when a provider credential is missing or invalid (verified live
+            # against the OmniRoute gateway). Classifying that as a provider
+            # failure is what keeps it out of the success path and lets the
+            # engine fall through to the next eligible route instead of
+            # returning an empty reply as if it were an answer. The stderr tail
+            # is carried through safe_diagnostic so an operator sees the
+            # actual cause rather than a bare class name.
+            return ProviderResult.failure(
+                FailureClass.MALFORMED_PROVIDER_RESPONSE,
+                safe_detail=safe_diagnostic(result.stderr or result.stdout or ""),
+            )
         successful_process = result
         return ProviderResult.success((result.stdout or "").strip())
 
@@ -1515,7 +1526,7 @@ def _run_with_phase3_routing(base_cmd, env, *, session_id, persona, cwd, caller_
     return successful_process, None, None
 
 
-def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None, readonly_key=None, workload_id=None):
+def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scope=None, readonly_key=None, workload_id=None, relay_body=None):
     """force_mode (Phase 4, 2026-08-04): when set, use that mode's toolset
     for THIS call only — does not read or write the persisted mode file, so
     it can never affect (or be affected by) the web UI's own current mode.
@@ -1614,6 +1625,14 @@ def run_hermes(hermes_session_id, message, persona, force_mode=None, caller_scop
 
     # See STALE_CALL_TIMEOUT_SECONDS' definition above for why this is set.
     env = {**os.environ, "HERMES_API_CALL_STALE_TIMEOUT": STALE_CALL_TIMEOUT_SECONDS}
+    # 2026-09-30: the Admin<->Hermes relay conversation is ambient process
+    # context, never a model-supplied value. The MCP server inherits this, so
+    # drafts Hermes proposes during an authorized relay turn are attributable
+    # to that conversation -- and a customer conversation, which sends no key,
+    # produces drafts that are not. Set to empty (not left inherited) when
+    # there is no relay, so a stale key can never leak into another turn.
+    relay_conversation_key = _parse_relay_conversation_key(relay_body) if relay_body else None
+    env["HERMES_RELAY_CONVERSATION_KEY"] = relay_conversation_key or ""
     # The real Hermes CLI call is the subprocess entrypoint below.  Ensure the
     # selected gateway target is visible to that request path without changing
     # the legacy default, and reject recursive topology before any inference is
@@ -1787,6 +1806,35 @@ def _parse_run_request(body):
     return hermes_session_id, message, persona, force_mode, readonly_key, caller_scope, None
 
 
+def _parse_relay_conversation_key(body):
+    """2026-09-30: which authorized Admin<->Hermes conversation is speaking.
+
+    fazle-core has already resolved and authorized the Admin by the time it
+    calls /run (modules.admin_hermes_authorization). It passes the resulting
+    conversation key here so that anything Hermes proposes during the turn can
+    be attributed to that conversation.
+
+    The reason this is environment context rather than a tool argument is the
+    Owner's boundary: the Admin<->Hermes relay and the customer/employee
+    conversation are never one authority. If the model could name its own
+    conversation, it could label a customer-originated draft as an Admin one
+    and make it grantable. It cannot -- this value is read from the request
+    body, written into the hermes subprocess environment by run_hermes, and
+    inherited by the MCP server. There is no tool that sets it.
+
+    Returns a normalized key, or None when the caller supplied none (which is
+    every non-relay caller, including customer conversations)."""
+    raw = (body.get("relay_conversation_key") or "").strip()
+    if not raw:
+        return None
+    # Deliberately narrow: this must look like the conversation key
+    # fazle-core actually mints ("hermes_relay:<bridge>:<phone>"), so a
+    # malformed or foreign value is dropped rather than passed through.
+    if not re.match(r"^hermes_relay:[a-z0-9_]+:.+$", raw, re.IGNORECASE):
+        return None
+    return raw.lower()
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, status, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -1905,6 +1953,9 @@ class Handler(BaseHTTPRequestHandler):
             reply, new_session_id, error, mode = run_hermes(
                 hermes_session_id, message, persona, force_mode=force_mode, caller_scope=caller_scope,
                 readonly_key=readonly_key, workload_id=workload_id,
+                # the raw body, so run_hermes can read relay_conversation_key
+                # (already authorized by fazle-core before this call).
+                relay_body=body,
             )
         finally:
             lock.release()

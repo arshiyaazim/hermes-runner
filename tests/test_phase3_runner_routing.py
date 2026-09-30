@@ -57,6 +57,40 @@ def _completed(stdout="reply", stderr="session_id: phase3", returncode=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
 
 
+def test_zero_exit_with_empty_reply_is_a_failure_not_a_success():
+    """The hermes CLI exits 0 with empty stdout when a provider credential is
+    missing or invalid. That must never surface as a successful empty reply:
+    it has to fail and let routing fall through to the next eligible route."""
+    replies = [
+        (_completed(stdout="", stderr="401 invalid api key", returncode=0), False, None),
+        (_completed(stdout="fallback reply"), False, None),
+    ]
+
+    def _sequence(*args, **kwargs):
+        return replies.pop(0)
+
+    with patch.object(server, "PHASE3_ROUTING_ENABLED", True), patch.object(
+        server, "_phase3_available_credential_refs",
+        return_value=frozenset({"local_runtime", "omniroute_api_key", "openrouter_api_key"}),
+    ), patch.object(server, "_run_hermes_once", side_effect=_sequence) as invoke:
+        reply, _, error, _ = server.run_hermes(None, "hello", "helpful", force_mode="READ")
+
+    assert invoke.call_count == 2, "empty primary must fall through to the next route"
+    assert error is None
+    assert reply == "fallback reply"
+    assert reply != ""
+    audits = server.get_last_routing_audits()
+    assert audits[0]["outcome"] == "failure"
+    assert audits[0]["model"] == "gemini/gemini-3.1-flash-lite"
+
+
+def test_empty_reply_classification_reaches_provider_failure():
+    """Directly assert the classification used for the empty-success case."""
+    from config.fazle_ai.contracts import FailureClass
+
+    assert FailureClass.MALFORMED_PROVIDER_RESPONSE.value == "malformed_provider_response"
+
+
 def test_policy_disabled_preserves_exact_legacy_single_selection():
     with patch.object(server, "PHASE3_ROUTING_ENABLED", False), patch.object(
         server, "_run_hermes_once", return_value=(_completed(), False, None)
