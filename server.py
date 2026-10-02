@@ -389,7 +389,7 @@ def _decrypt_runner_credential(encoded):
         if len(raw) < 28:
             return ""
         key = __import__("hashlib").sha256(RUNNER_SECRET.encode()).digest()
-        return AESGCM(key).decrypt(raw[:12], raw[28:], raw[12:28]).decode()
+        return AESGCM(key).decrypt(raw[:12], raw[28:] + raw[12:28], None).decode()
     except Exception:
         return ""
 
